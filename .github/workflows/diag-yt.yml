@@ -8,31 +8,26 @@ jobs:
         with: { python-version: "3.12" }
       - name: Install yt-dlp
         run: pip install -q "yt-dlp>=2024.8.6"
-      - name: Probe pencarian Douyin
+      - name: Probe Douyin putaran 2 - cookie pengunjung + parameter penuh
         shell: bash
         run: |
           set +e
-          echo "=== extractor douyin yt-dlp:"
-          python3 -m yt_dlp --list-extractors 2>/dev/null | grep -i douyin
-          echo "=== A) endpoint search web Douyin mentah"
-          timeout 30 curl -s "https://www.douyin.com/aweme/v1/web/search/item/?keyword=%E7%8C%AB&count=5" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" -H "Referer: https://www.douyin.com/" -o /tmp/dy.json -w "http=%{http_code} bytes=%{size_download}\n"
-          head -c 200 /tmp/dy.json; echo
-          echo "=== B) indeks Bing site:douyin.com/video"
-          timeout 30 curl -s "https://www.bing.com/search?q=site%3Adouyin.com%2Fvideo+%E7%8C%AB&count=20" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" -o /tmp/bing.html -w "http=%{http_code} bytes=%{size_download}\n"
-          grep -o "douyin\.com/video/[0-9]*" /tmp/bing.html | sort -u | head -8
-          echo "jumlah tautan video unik: $(grep -o "douyin\.com/video/[0-9]*" /tmp/bing.html | sort -u | wc -l)"
-      - name: Uji unduh satu video Douyin hasil indeks
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          curl -s -c /tmp/ck.txt "https://www.douyin.com/" -H "User-Agent: $UA" -o /dev/null
+          echo "cookie didapat: $(grep -c . /tmp/ck.txt) baris; ttwid: $(grep -c ttwid /tmp/ck.txt)"
+          P="device_platform=webapp&aid=6383&channel=channel_pc_web&search_channel=aweme_video_web&keyword=%E7%8C%AB&search_source=normal_search&query_correct_type=1&is_filter_search=0&offset=0&count=10&need_filter_settings=0&list_type=single&pc_search_top_1_params=%7B%22enable_ai_search_top_1%22%3A1%7D&version_code=190600&version_name=19.6.0&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome&browser_version=124.0.0.0&browser_online=true&engine_name=Blink&engine_version=124.0.0.0&os_name=Windows&os_version=10&cpu_core_num=8&device_memory=8&platform=PC&downlink=10&effective_type=4g&round_trip_time=50"
+          timeout 30 curl -s "https://www.douyin.com/aweme/v1/web/search/item/?$P" -b /tmp/ck.txt -H "User-Agent: $UA" -H "Referer: https://www.douyin.com/search/%E7%8C%AB?type=video" -o /tmp/dy2.json -w "http=%{http_code} bytes=%{size_download}\n"
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/dy2.json'))
+          lst = d.get('data') or d.get('aweme_list') or []
+          print('status:', d.get('status_code'), '| jumlah hasil:', len(lst))
+          for it in lst[:3]:
+              a = it.get('aweme_info') or it
+              print('-', (a.get('desc') or '')[:50], '| id:', a.get('aweme_id'))
+          " 2>&1 | head -6
+      - name: Cari tautan berbagi Douyin asli untuk uji unduh
         shell: bash
         run: |
           set +e
-          timeout 30 curl -s "https://www.bing.com/search?q=site%3Adouyin.com%2Fvideo+%E7%8C%AB&count=20" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" -o /tmp/bing.html
-          VID=$(grep -o "douyin\.com/video/[0-9]*" /tmp/bing.html | sort -u | head -1)
-          echo "video uji: $VID"
-          if [ -n "$VID" ]; then
-            timeout 60 python3 -m yt_dlp -j --no-warnings "https://www.$VID" > /tmp/j.txt 2> /tmp/e.txt; echo "metadata rc=$?"
-            grep -o '"title": *"[^"]*"' /tmp/j.txt | head -1
-            grep -o "ERROR: .*" /tmp/e.txt | head -c 200; echo
-            rm -rf /tmp/dl && mkdir -p /tmp/dl
-            timeout 120 python3 -m yt_dlp -f "b/bv*+ba" --merge-output-format mp4 --max-filesize 50M --no-playlist --no-warnings -o "/tmp/dl/%(title).60s.%(ext)s" "https://www.$VID" > /tmp/o.txt 2> /tmp/e2.txt; echo "unduh rc=$?"
-            cat /tmp/e2.txt | tail -2; ls -la /tmp/dl/
-          fi
+          echo "(tautan uji diambil dari hasil pencarian web yang dijalankan agen induk)"
