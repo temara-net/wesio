@@ -205,3 +205,49 @@ tambahan sejalan untuk jalur sistem:
   (lompat 429 asli) dan daftar FAST sistem berkoma di env produksi.
 - Deploy tambahan ini ke Worker live — di luar lingkup tugas lokal
   ini (belum di-push, belum di-deploy).
+
+# Tambahan 1 Nov 2026 — Pemilik full access (admin = Premium permanen + kuota dilewati)
+
+Koreksi pemilik: akun admin selama ini hanya kebal ban dan bisa
+membuka perintah admin, tetapi di modul ia diperlakukan pengguna Free
+(kuota berlaku, model Strong terkunci, layar Premium menawarkan
+invoice 250 Stars kepadanya). Kini di worker/worker.js:
+
+- `premiumAktif()` mengembalikan true untuk ADMIN_ID — Strong dan
+  tugas Image terbuka lewat gerbang yang sama dengan pengguna Premium
+  berbayar; tidak ada lagi pembacaan KV premium di luar fungsi ini
+  untuk gerbang modul (diverifikasi dengan pemindaian kode).
+- Kuota AI, kuota unduh, dan kuota gambar untuk admin DILEWATI
+  sepenuhnya: tidak dicek dan tidak dipotong (tidak ada record
+  `quota:<admin>:*` yang tertulis). Pemakaian tetap masuk statistik.
+- Tampilan sisa kuota untuk admin diganti keterangan "👑 Owner:
+  unlimited" (header modul AI + kaki jawaban AI), "👑 Owner:
+  unlimited downloads" (header Downloader + balasan Processing), dan
+  keterangan unlimited sesudah pembuatan gambar — pilihan ini yang
+  paling konsisten dengan teks yang sudah ada.
+- Layar Premium untuk admin: status persis "👑 Owner — full access.
+  No subscription needed, all limits are lifted for your account.",
+  TANPA tombol Buy; callback beli lama dari admin ditolak sopan
+  dengan pesan yang sama dan TIDAK membuat invoice.
+- /admin_stats dan seluruh perilaku pengguna non-admin tidak berubah.
+
+## Hasil uji putaran ini (dijalankan di mesin ini)
+
+- `node tests/run_worker_test.mjs` → **146 lulus, 0 gagal** = 128 uji
+  lama (regresi utuh; dijalankan juga sebelum uji baru ditambah,
+  tetap 128/128 sesudah perubahan kode) + 18 uji baru bagian 19:
+  admin mengirim 17 pesan AI melewati batas Free 15 tanpa record
+  kuota; Strong terkirim sebagai model untuk admin tanpa record
+  Premium KV; tugas Image jalan untuk admin tanpa potong kuota
+  gambar; 7 unduhan admin ter-dispatch melewati batas Free 5 tanpa
+  record kuota; layar Premium admin = status pemilik & nol invoice
+  (termasuk lewat callback beli); pengguna biasa tetap status Free,
+  tetap ditawari tombol Buy, dan tetap menerima invoice Stars 250.
+- `python3 tests/run_executor_test.py` → **12 lulus, 0 gagal**
+  (regresi). `node --check worker/worker.js` → OK. Audit nama
+  pribadi di worker/ + tests/ → 0 temuan.
+
+## Belum terbukti untuk tambahan ini
+- Perilaku di layanan asli (Worker live belum menerima deploy
+  putaran ini — di luar lingkup tugas; push/deploy menunggu agen
+  induk). Uji di atas adalah bukti lokal dengan io tiruan.

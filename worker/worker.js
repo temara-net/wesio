@@ -257,6 +257,12 @@ async function catatPengguna(io, uid) {
 }
 
 export async function premiumAktif(io, uid) {
+  // The owner never buys Premium in their own bot: the admin account
+  // counts as Premium at every module gate (strong model, image task)
+  // without any KV subscription record. The daily quotas themselves
+  // are lifted separately at the AI/Downloader quota paths (see the
+  // adalahAdmin guards there) so the owner's usage is never counted.
+  if (adalahAdmin(io, uid)) return true;
   const v = await io.kvGet("premium:" + uid);
   if (!v) return false;
   const t = Date.parse(v);
@@ -413,8 +419,11 @@ async function mulaiAi(io, chatId, uid) {
   const barisKuota = kunci
     ? `🔑 Your own ${(BYOK_PROVIDERS[kunci.provider] || {}).name || "provider"} ` +
       "API key is active — no daily quota applies to you."
-    : `Model: ${c.aiModel === "strong" ? "🧠 Strong" : "⚡ Fast"}\n` +
-      `AI messages left today: ${sisa} of ${batasAi(prem)}`;
+    : adalahAdmin(io, uid)
+      ? `Model: ${c.aiModel === "strong" ? "🧠 Strong" : "⚡ Fast"}\n` +
+        "👑 Owner: unlimited"
+      : `Model: ${c.aiModel === "strong" ? "🧠 Strong" : "⚡ Fast"}\n` +
+        `AI messages left today: ${sisa} of ${batasAi(prem)}`;
   await io.send(chatId,
     "🤖 AI Chat\n\n" +
     "Ask me anything, or pick a quick task below.\n" +
@@ -436,9 +445,10 @@ async function prosesAi(io, chatId, uid, teks) {
     return;
   }
   const prem = await premiumAktif(io, uid);
+  const admin = adalahAdmin(io, uid);
   const c = await muatConv(io, uid);
 
-  // Image task: Premium only, own daily quota.
+  // Image task: Premium only, own daily quota (lifted for the owner).
   if (c.aiTask === "image") {
     c.aiTask = null;
     await simpanConv(io, uid, c);
@@ -455,7 +465,7 @@ async function prosesAi(io, chatId, uid, teks) {
       return;
     }
     const usedImg = await kuotaTerpakai(io, uid, "aimg");
-    if (usedImg >= LIMITS.imagePremium) {
+    if (!admin && usedImg >= LIMITS.imagePremium) {
       await io.send(chatId,
         `You've used all ${LIMITS.imagePremium} image creations for ` +
         "today. They reset tomorrow at 00:00 UTC.", AI_KEYBOARD);
@@ -464,11 +474,13 @@ async function prosesAi(io, chatId, uid, teks) {
     await io.send(chatId, "🎨 Creating your picture…");
     try {
       const url = await io.genImage(teks);
-      await kuotaTambah(io, uid, "aimg");
+      if (!admin) await kuotaTambah(io, uid, "aimg");
       await io.sendPhoto(chatId, url, "Here is your picture 🎨");
       await io.send(chatId,
-        `Images left today: ${LIMITS.imagePremium - usedImg - 1} of ` +
-        `${LIMITS.imagePremium}`, AI_KEYBOARD);
+        admin
+          ? "👑 Owner: unlimited — no daily image limit for your account."
+          : `Images left today: ${LIMITS.imagePremium - usedImg - 1} of ` +
+            `${LIMITS.imagePremium}`, AI_KEYBOARD);
     } catch (e) {
       await io.send(chatId,
         "The picture maker is busy right now. Please try again in a " +
@@ -478,7 +490,7 @@ async function prosesAi(io, chatId, uid, teks) {
   }
 
   const sisa = await sisaAi(io, uid, prem);
-  if (!kunci && sisa <= 0) {
+  if (!kunci && !admin && sisa <= 0) {
     await io.send(chatId,
       `You've used all ${batasAi(prem)} AI messages for today. Your ` +
       "quota resets tomorrow at 00:00 UTC.\n\n" +
@@ -604,6 +616,12 @@ async function prosesAi(io, chatId, uid, teks) {
     await io.send(chatId,
       `${jawaban}\n\n—\n🔑 Using your own API key — no Wesio quota used`,
       AI_KEYBOARD);
+    return;
+  }
+  if (admin) {
+    // The owner's usage is never counted against any quota.
+    await io.send(chatId,
+      `${jawaban}\n\n—\n👑 Owner: unlimited`, AI_KEYBOARD);
     return;
   }
   const terpakai = await kuotaTambah(io, uid, "ai");
@@ -882,7 +900,9 @@ async function mulaiDownload(io, chatId, uid) {
     "Send me a video link from TikTok, Instagram, YouTube or X, and " +
     "I'll send the file back here.\n" +
     "Example: https://www.tiktok.com/@user/video/123456789\n\n" +
-    `${prem ? "Downloads" : "Free downloads"} left today: ${sisa} of ${batasDl(prem)}`,
+    (adalahAdmin(io, uid)
+      ? "👑 Owner: unlimited downloads"
+      : `${prem ? "Downloads" : "Free downloads"} left today: ${sisa} of ${batasDl(prem)}`),
     MENU_MARKUP);
 }
 
@@ -900,7 +920,7 @@ async function terimaTautan(io, chatId, uid, teks) {
     return;
   }
   const prem = await premiumAktif(io, uid);
-  if ((await sisaDl(io, uid, prem)) <= 0) {
+  if (!adalahAdmin(io, uid) && (await sisaDl(io, uid, prem)) <= 0) {
     await io.send(chatId,
       `You've used all ${batasDl(prem)} downloads for today. Your quota ` +
       "resets tomorrow at 00:00 UTC.\n\n" +
@@ -933,7 +953,8 @@ async function jalankanDownload(io, chatId, uid, format) {
     return;
   }
   const prem = await premiumAktif(io, uid);
-  if ((await sisaDl(io, uid, prem)) <= 0) {
+  const admin = adalahAdmin(io, uid);
+  if (!admin && (await sisaDl(io, uid, prem)) <= 0) {
     await io.send(chatId,
       "Your download quota for today just ran out. It resets tomorrow " +
       "at 00:00 UTC.", prem ? MENU_MARKUP : GO_PREMIUM_MARKUP);
@@ -951,18 +972,38 @@ async function jalankanDownload(io, chatId, uid, format) {
       "again in a moment.", MENU_MARKUP);
     return;
   }
-  const terpakai = await kuotaTambah(io, uid, "dl");
+  // The owner's downloads are never counted against the quota.
+  const terpakai = admin ? await kuotaTerpakai(io, uid, "dl")
+                         : await kuotaTambah(io, uid, "dl");
   await statTambah(io, "dl");
   const sisaNow = Math.max(0, batasDl(prem) - terpakai);
   await io.send(chatId,
     "⏳ Processing your download… I'll send the file right here when " +
     "it's ready (usually under a minute).\n\n" +
-    `${prem ? "Downloads" : "Free downloads"} left today: ${sisaNow} of ${batasDl(prem)}`,
+    (admin ? "👑 Owner: unlimited downloads"
+      : `${prem ? "Downloads" : "Free downloads"} left today: ${sisaNow} of ${batasDl(prem)}`),
     MENU_MARKUP);
 }
 
 // ---------------- Module: Premium (Telegram Stars) ----------------
 async function tampilPremium(io, chatId, uid) {
+  // The owner never sees a price tag in their own bot: full access is
+  // already theirs — no status countdown, no Buy button, no invoice.
+  if (adalahAdmin(io, uid)) {
+    await io.send(chatId,
+      "⭐ WesioBot Premium\n\n" +
+      "Your status: 👑 Owner — full access. No subscription needed, " +
+      "all limits are lifted for your account.\n\n" +
+      "What Premium means for your users:\n" +
+      `🤖 AI: ${LIMITS.aiFree} messages/day → ${LIMITS.aiPremium}/day, ` +
+      "strongest model, 20 images/day\n" +
+      `⬇️ Downloads: ${LIMITS.dlFree}/day → ${LIMITS.dlPremium}/day, ` +
+      "priority queue\n" +
+      `Price for users: ${LIMITS.premiumStars} Stars for ` +
+      `${LIMITS.premiumDays} days, paid inside Telegram.`,
+      MENU_MARKUP);
+    return;
+  }
   const prem = await premiumAktif(io, uid);
   const sampai = await premiumSampai(io, uid);
   let status;
@@ -992,6 +1033,14 @@ async function tampilPremium(io, chatId, uid) {
 }
 
 async function beliPremium(io, chatId, uid) {
+  // Even if a stale Buy button reaches the admin, never create an
+  // invoice for the owner — their access is already full.
+  if (adalahAdmin(io, uid)) {
+    await io.send(chatId,
+      "👑 Owner — full access. No subscription needed, all limits " +
+      "are lifted for your account.", MENU_MARKUP);
+    return;
+  }
   await io.sendInvoice(chatId, {
     title: "WesioBot Premium",
     description: `${LIMITS.premiumDays} days of WesioBot Premium: ` +

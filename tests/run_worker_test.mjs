@@ -804,5 +804,97 @@ console.log("18) Rantai jalur SISTEM: AI_MODEL_FAST daftar koma ditelusuri denga
       terakhir(W3).text.slice(0, 200));
 }
 
+console.log("19) Pemilik/admin: full access — kuota dilewati, Strong & Image terbuka, Premium tanpa invoice");
+{
+  // AI: admin melewati batas Free (15) tanpa terpotong dan tanpa terhenti.
+  const W = buatIo({ ai: AI_ON, adminId: 111 });
+  await handleUpdate(W.io, msg(111, "🤖 AI Chat"));
+  cek("intro AI admin menampilkan '👑 Owner: unlimited', bukan angka sisa",
+      terakhir(W).text.includes("👑 Owner: unlimited") &&
+      !terakhir(W).text.includes("messages left today"), terakhir(W).text.slice(-250));
+  for (let i = 1; i <= 17; i++) {
+    await handleUpdate(W.io, msg(111, "tanya " + i));
+  }
+  cek("admin: 17 pesan AI semua dijawab (melewati batas Free 15)",
+      W.aiCalls.length === 17, String(W.aiCalls.length));
+  cek("admin: kuota AI TIDAK pernah tercatat terpotong di KV",
+      !W.kv.has(`quota:111:ai:${hariIniUTC()}`), [...W.kv.keys()].join(","));
+  cek("jawaban AI admin berkaki '👑 Owner: unlimited'",
+      W.terkirim.some(x => x.text.includes("Mock AI answer.") &&
+        x.text.includes("👑 Owner: unlimited")), "");
+  cek("tidak ada pesan admin yang menampilkan sisa kuota angka",
+      !semua(W).includes("AI messages left today"), semua(W).slice(-300));
+
+  // Strong terbuka untuk admin tanpa record Premium di KV.
+  const W2 = buatIo({ ai: AI_ON, adminId: 111 });
+  await handleUpdate(W2.io, msg(111, "/ai"));
+  await handleUpdate(W2.io, cb(111, "ai:model:strong"));
+  cek("admin memilih Strong -> diterima, tanpa record Premium KV",
+      terakhir(W2).text.includes("Model set to 🧠 Strong") &&
+      !W2.kv.has("premium:111"), terakhir(W2).text);
+  await handleUpdate(W2.io, msg(111, "halo strong"));
+  cek("panggilan AI admin benar-benar memakai model strong",
+      W2.aiCalls.length === 1 && W2.aiCalls[0].model === "strong-1",
+      JSON.stringify(W2.aiCalls.map(a => a.model)));
+
+  // Tugas Image terbuka untuk admin; kuota gambar tidak terpotong.
+  const AI_IMG = { ...AI_ON, imageModel: "img-1" };
+  const W3 = buatIo({ ai: AI_IMG, adminId: 111 });
+  await handleUpdate(W3.io, msg(111, "/ai"));
+  await handleUpdate(W3.io, cb(111, "ai:task:image"));
+  await handleUpdate(W3.io, msg(111, "a lighthouse at dawn"));
+  cek("admin memakai tugas Image tanpa gerbang Premium",
+      W3.terkirim.some(x => x.text.includes("Creating your picture")) &&
+      !semua(W3).includes("Premium feature"), semua(W3).slice(-300));
+  cek("admin: kuota gambar TIDAK terpotong di KV",
+      !W3.kv.has(`quota:111:aimg:${hariIniUTC()}`), [...W3.kv.keys()].join(","));
+  cek("sesudah gambar, admin melihat keterangan unlimited",
+      W3.terkirim.some(x => x.text.includes("Owner: unlimited")), "");
+
+  // Downloader: admin melewati batas Free (5) tanpa terpotong.
+  const W4 = buatIo({ ai: AI_ON, adminId: 111 });
+  await handleUpdate(W4.io, msg(111, "⬇️ Downloader"));
+  cek("intro Downloader admin menampilkan '👑 Owner: unlimited downloads'",
+      terakhir(W4).text.includes("👑 Owner: unlimited downloads"),
+      terakhir(W4).text.slice(-200));
+  for (let i = 1; i <= 7; i++) {
+    await handleUpdate(W4.io, msg(111, "https://www.tiktok.com/@user/video/" + (2000 + i)));
+    await handleUpdate(W4.io, cb(111, "dl:video"));
+  }
+  cek("admin: 7 unduhan semua ter-dispatch (melewati batas Free 5)",
+      W4.dispatches.length === 7, String(W4.dispatches.length));
+  cek("admin: kuota unduh TIDAK pernah tercatat terpotong di KV",
+      !W4.kv.has(`quota:111:dl:${hariIniUTC()}`), [...W4.kv.keys()].join(","));
+
+  // Layar Premium admin: status pemilik persis, tanpa tombol Buy;
+  // callback beli lama pun ditolak sopan dan TIDAK membuat invoice.
+  const W5 = buatIo({ ai: AI_ON, adminId: 111 });
+  await handleUpdate(W5.io, msg(111, "/premium"));
+  cek("layar Premium admin memuat status pemilik persis",
+      terakhir(W5).text.includes("👑 Owner — full access. No subscription needed, all limits are lifted for your account."),
+      terakhir(W5).text.slice(0, 250));
+  const btnAdmin = (terakhir(W5).markup?.inline_keyboard || []).flat()
+    .map(b => b.callback_data);
+  cek("layar Premium admin TIDAK memuat tombol Buy",
+      !btnAdmin.includes("buy:premium"), JSON.stringify(btnAdmin));
+  await handleUpdate(W5.io, cb(111, "buy:premium"));
+  cek("alur beli dari admin ditolak sopan + TIDAK ada invoice dibuat",
+      W5.invoices.length === 0 &&
+      terakhir(W5).text.includes("👑 Owner — full access"), terakhir(W5).text.slice(0, 150));
+
+  // Pengguna biasa di W yang sama: perilaku Premium tidak berubah.
+  await handleUpdate(W5.io, msg(222, "/premium"));
+  const btnUser = (terakhir(W5).markup?.inline_keyboard || []).flat()
+    .map(b => b.callback_data);
+  cek("pengguna biasa tetap status Free + tombol Buy tampil",
+      terakhir(W5).text.includes("Your status: Free") &&
+      btnUser.includes("buy:premium"), terakhir(W5).text.slice(0, 150));
+  await handleUpdate(W5.io, cb(222, "buy:premium"));
+  cek("pengguna biasa tetap menerima invoice Stars 250",
+      W5.invoices.length === 1 &&
+      W5.invoices[0].inv.payload === "premium:222" &&
+      W5.invoices[0].inv.prices[0].amount === 250, JSON.stringify(W5.invoices));
+}
+
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);
 process.exit(gagal ? 1 : 0);
