@@ -7,20 +7,21 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Install yt-dlp
-        run: pip install -q "yt-dlp>=2024.8.6"
-      - name: Shorts sehat - tiga probe
+        run: pip install -q "yt-dlp>=2024.8.6" curl_cffi
+      - name: Rotasi klien YouTube pada Shorts sehat
         shell: bash
         run: |
           set +e
           U="https://www.youtube.com/shorts/BCaCmDrc_mM"
-          echo "=== A) metadata -j"
-          timeout 60 python3 -m yt_dlp -j --no-warnings "$U" > /tmp/j.txt 2> /tmp/e1.txt; echo "rc=$?"
-          head -c 150 /tmp/j.txt; echo; cat /tmp/e1.txt
-          echo "=== B) unduh format gabungan (produksi)"
-          rm -rf /tmp/dl && mkdir -p /tmp/dl
-          timeout 240 python3 -m yt_dlp -f "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" --merge-output-format mp4 --max-filesize 50M --no-playlist --no-warnings -o "/tmp/dl/%(title).80s.%(ext)s" "$U" > /tmp/o2.txt 2> /tmp/e2.txt; echo "rc=$?"
-          cat /tmp/o2.txt; cat /tmp/e2.txt; ls -la /tmp/dl/
-          echo "=== C) unduh format progresif tunggal"
-          rm -rf /tmp/dl2 && mkdir -p /tmp/dl2
-          timeout 240 python3 -m yt_dlp -f "b[height<=720]/b" --max-filesize 50M --no-playlist --no-warnings -o "/tmp/dl2/%(title).80s.%(ext)s" "$U" > /tmp/o3.txt 2> /tmp/e3.txt; echo "rc=$?"
-          cat /tmp/o3.txt; cat /tmp/e3.txt; ls -la /tmp/dl2/
+          for c in android ios tv web_embedded mweb; do
+            echo "=== client=$c"
+            timeout 60 python3 -m yt_dlp -j --no-warnings --extractor-args "youtube:player_client=$c" "$U" > /tmp/j.txt 2> /tmp/e.txt
+            echo "rc=$?"
+            grep -o '"title": *"[^"]*"' /tmp/j.txt | head -1
+            grep -o "ERROR: .*" /tmp/e.txt | head -c 200; echo
+          done
+          echo "=== client=android + impersonate chrome"
+          timeout 60 python3 -m yt_dlp -j --no-warnings --extractor-args "youtube:player_client=android" --impersonate chrome "$U" > /tmp/j.txt 2> /tmp/e.txt
+          echo "rc=$?"
+          grep -o '"title": *"[^"]*"' /tmp/j.txt | head -1
+          grep -o "ERROR: .*" /tmp/e.txt | head -c 200; echo
