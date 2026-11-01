@@ -29,7 +29,8 @@ hasil uji yang benar-benar dijalankan di mesin ini.
 - worker/package.json, worker/wrangler.toml.
 
 ## Sedang dikerjakan
-- Commit lokal berkas Tahap 1.
+- Tidak ada. Kode Tahap 1 sudah ter-commit lokal (2 commit); menunggu
+  peninjauan dan tahap aktivasi.
 
 ## Belum dikerjakan
 - Aktivasi produksi (di luar lingkup tugas bangun lokal ini): buat KV
