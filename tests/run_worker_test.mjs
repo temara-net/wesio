@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const { handleUpdate, hariIniUTC, MENU_BUTTONS } =
+const { handleUpdate, hariIniUTC, MENU_BUTTONS, buatIo: buatIoAsli } =
   await import(pathToFileURL(path.join(ROOT, "worker", "worker.js")).href);
 
 let lulus = 0, gagal = 0;
@@ -26,6 +26,8 @@ function buatIo(opts = {}) {
   const dispatches = [];
   const aiCalls = [];
   const keyTests = [];
+  const photos = [];
+  const photoBytes = [];
   const io = {
     adminId: opts.adminId ?? 111,
     ai: opts.ai ?? AI_OFF,
@@ -34,7 +36,9 @@ function buatIo(opts = {}) {
     kvDel: async (k) => { kv.delete(k); },
     kvList: async (p) => [...kv.keys()].filter(k => k.startsWith(p)),
     send: async (chatId, text, markup) => { terkirim.push({ chatId, text, markup }); },
-    sendPhoto: async () => {},
+    sendPhoto: async (chatId, url, caption) => { photos.push({ chatId, url, caption }); },
+    sendPhotoBytes: async (chatId, base64, mimeType, caption) => {
+      photoBytes.push({ chatId, base64, mimeType, caption }); },
     sendInvoice: async (chatId, inv) => { invoices.push({ chatId, inv }); },
     answerPreCheckout: async (id, ok, err) => { prechecks.push({ id, ok, err }); },
     answerCallback: async () => {},
@@ -68,10 +72,10 @@ function buatIo(opts = {}) {
       if (key.startsWith("sk-good")) return { ok: true };
       return { ok: false, reason: "rejected" };
     },
-    genImage: async () => "https://img.invalid/pic.png",
+    genImage: opts.genImage ?? (async () => "https://img.invalid/pic.png"),
     dispatch: async (jobId) => { dispatches.push(jobId); },
   };
-  return { io, kv, terkirim, invoices, prechecks, dispatches, aiCalls, keyTests };
+  return { io, kv, terkirim, invoices, prechecks, dispatches, aiCalls, keyTests, photos, photoBytes };
 }
 
 let seq = 0;
@@ -894,6 +898,190 @@ console.log("19) Pemilik/admin: full access — kuota dilewati, Strong & Image t
       W5.invoices.length === 1 &&
       W5.invoices[0].inv.payload === "premium:222" &&
       W5.invoices[0].inv.prices[0].amount === 250, JSON.stringify(W5.invoices));
+}
+
+console.log("20) Gambar: jalur Gemini natif (adapter asli + fetch tiruan), jalur OpenAI lama, gagal tanpa inlineData");
+{
+  const fetchAsli = globalThis.fetch;
+  const B64_PNG = "iVBORw0KGgo="; // 8 byte tanda tangan PNG dalam base64
+
+  function kvTiruan() {
+    const m = new Map();
+    return {
+      map: m,
+      get: async (k) => (m.has(k) ? m.get(k) : null),
+      put: async (k, v) => { m.set(k, v); },
+      delete: async (k) => { m.delete(k); },
+      list: async ({ prefix }) => ({
+        keys: [...m.keys()].filter(k => k.startsWith(prefix))
+          .map(name => ({ name })),
+        list_complete: true,
+      }),
+    };
+  }
+  const okJson = (data) => ({ ok: true, status: 200, json: async () => data });
+  function pasangFetch(penangan) {
+    const calls = [];
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      calls.push({ url: u, init });
+      if (u.startsWith("https://api.telegram.org/")) return okJson({ ok: true, result: {} });
+      return penangan(u, init);
+    };
+    return calls;
+  }
+  const teksTelegram = (calls) => calls
+    .filter(c => c.url.endsWith("/sendMessage"))
+    .map(c => { try { return JSON.parse(c.init.body).text || ""; } catch (e) { return ""; } })
+    .join("\n");
+  function envAsli(wkv, over = {}) {
+    return {
+      TG_BOT_TOKEN: "token-tiruan", ADMIN_ID: "111", GH_TOKEN: "gh-tiruan",
+      AI_API_KEY: "kunci-sistem-tiruan",
+      AI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      AI_MODEL_FAST: "gemini-2.5-flash", AI_MODEL_STRONG: "gemini-2.5-pro",
+      AI_IMAGE_MODEL: "gemini-2.5-flash-image",
+      WKV: wkv, ...over,
+    };
+  }
+  async function alurGambar(io, uid, prompt) {
+    await handleUpdate(io, msg(uid, "/ai"));
+    await handleUpdate(io, cb(uid, "ai:task:image"));
+    await handleUpdate(io, msg(uid, prompt));
+  }
+
+  try {
+    // (a) Basis Google -> endpoint natif :generateContent, inlineData
+    // diurai, foto dikirim multipart; admin tanpa potong kuota gambar,
+    // pengguna Premium terpotong tepat 1.
+    const genOk = { candidates: [{ content: { parts: [
+      { text: "Here you go" },
+      { inlineData: { mimeType: "image/png", data: B64_PNG } },
+    ] } }] };
+    for (const [uid, admin] of [[111, true], [21001, false]]) {
+      const label = admin ? "admin" : "Premium";
+      const wkv = kvTiruan();
+      if (!admin) {
+        await wkv.put("premium:" + uid,
+          new Date(Date.now() + 86400000).toISOString());
+      }
+      const calls = pasangFetch(async () => okJson(genOk));
+      const io = buatIoAsli(envAsli(wkv));
+      await alurGambar(io, uid, "a cat riding a crocodile");
+      const genCall = calls.find(c => c.url.includes(":generateContent"));
+      cek(`Gemini (${label}): URL natif :generateContent memakai model dari env`,
+          !!genCall && genCall.url ===
+            "https://generativelanguage.googleapis.com/v1beta/models/" +
+            "gemini-2.5-flash-image:generateContent",
+          genCall ? genCall.url : "tidak ada panggilan generateContent");
+      const genBody = genCall ? JSON.parse(genCall.init.body) : {};
+      cek(`Gemini (${label}): body = contents[{parts:[{text}]}] + responseModalities TEXT,IMAGE; kunci di header`,
+          genBody.contents?.[0]?.parts?.[0]?.text === "a cat riding a crocodile" &&
+          JSON.stringify(genBody.generationConfig?.responseModalities) ===
+            JSON.stringify(["TEXT", "IMAGE"]) &&
+          genCall.init.headers["x-goog-api-key"] === "kunci-sistem-tiruan",
+          JSON.stringify(genBody).slice(0, 200));
+      cek(`Gemini (${label}): TIDAK ada panggilan /images/generations`,
+          !calls.some(c => c.url.includes("/images/generations")), "");
+      const fotoCall = calls.find(c => c.url.endsWith("/sendPhoto"));
+      const form = fotoCall && fotoCall.init.body;
+      const berkas = form instanceof FormData ? form.get("photo") : null;
+      cek(`Gemini (${label}): sendPhoto MULTIPART — FormData berisi berkas PNG hasil urai inlineData`,
+          form instanceof FormData &&
+          form.get("chat_id") === String(uid) &&
+          String(form.get("caption") || "").includes("picture") &&
+          !!berkas && berkas.type === "image/png" && berkas.size === 8,
+          berkas ? `${berkas.type}/${berkas.size}` : "bukan FormData");
+      cek(`Gemini (${label}): kuota gambar ` +
+            (admin ? "admin TIDAK terpotong" : "Premium terpotong tepat 1"),
+          admin
+            ? !wkv.map.has(`quota:${uid}:aimg:${hariIniUTC()}`) &&
+              teksTelegram(calls).includes("Owner: unlimited")
+            : wkv.map.get(`quota:${uid}:aimg:${hariIniUTC()}`) === "1" &&
+              teksTelegram(calls).includes("Images left today: 19 of 20"),
+          [...wkv.map.keys()].join(","));
+    }
+
+    // (b) Basis non-Google -> jalur lama /images/generations + sendPhoto URL.
+    {
+      const wkv = kvTiruan();
+      await wkv.put("premium:21002",
+        new Date(Date.now() + 86400000).toISOString());
+      const calls = pasangFetch(async (u) =>
+        u.includes("/images/generations")
+          ? okJson({ data: [{ url: "https://img.invalid/hasil.png" }] })
+          : okJson({}));
+      const io = buatIoAsli(envAsli(wkv, {
+        AI_BASE_URL: "https://api.openai.com/v1",
+        AI_MODEL_FAST: "fast-x", AI_MODEL_STRONG: "strong-x",
+        AI_IMAGE_MODEL: "model-gambar-x",
+      }));
+      await alurGambar(io, 21002, "a lighthouse at dawn");
+      const genCall = calls.find(c => c.url.includes("/images/generations"));
+      cek("non-Google: /images/generations lama dipakai dengan model dari env",
+          !!genCall &&
+          genCall.url === "https://api.openai.com/v1/images/generations" &&
+          JSON.parse(genCall.init.body).model === "model-gambar-x",
+          genCall ? genCall.url : "tidak ada panggilan gambar");
+      cek("non-Google: TIDAK ada panggilan :generateContent",
+          !calls.some(c => c.url.includes(":generateContent")), "");
+      const fotoCall = calls.find(c => c.url.endsWith("/sendPhoto"));
+      const fotoBody = fotoCall ? JSON.parse(fotoCall.init.body) : {};
+      cek("non-Google: sendPhoto memakai URL hasil (JSON, bukan multipart)",
+          fotoBody.photo === "https://img.invalid/hasil.png" &&
+          fotoBody.chat_id === 21002, JSON.stringify(fotoBody).slice(0, 150));
+      cek("non-Google: kuota gambar Premium terpotong tepat 1",
+          wkv.map.get(`quota:21002:aimg:${hariIniUTC()}`) === "1", "");
+    }
+
+    // (c) Respons Gemini tanpa inlineData -> pesan gagal manusiawi,
+    // tanpa kirim foto, tanpa potong kuota, tanpa teks teknis.
+    {
+      const wkv = kvTiruan();
+      await wkv.put("premium:21003",
+        new Date(Date.now() + 86400000).toISOString());
+      const genTeksSaja = { candidates: [{ content: { parts: [
+        { text: "I cannot draw that." }] } }] };
+      const calls = pasangFetch(async () => okJson(genTeksSaja));
+      const io = buatIoAsli(envAsli(wkv));
+      await alurGambar(io, 21003, "something un-drawable");
+      const teks = teksTelegram(calls);
+      cek("Gemini tanpa inlineData: pesan gagal manusiawi tampil",
+          teks.includes("The picture maker is busy right now"),
+          teks.slice(-300));
+      cek("Gemini tanpa inlineData: TIDAK ada sendPhoto & kuota utuh",
+          !calls.some(c => c.url.endsWith("/sendPhoto")) &&
+          !wkv.map.has(`quota:21003:aimg:${hariIniUTC()}`), "");
+      cek("Gemini tanpa inlineData: tanpa teks teknis mentah ke pengguna",
+          !/Image empty|HTTP \d|inlineData/.test(teks), teks.slice(-200));
+    }
+
+    // (d) Cabang Image (io tiruan): bentuk hasil menentukan jalur kirim.
+    const AI_IMG20 = { ...AI_ON, imageModel: "img-1" };
+    const Wu = buatIo({ ai: AI_IMG20,
+      genImage: async () => ({ url: "https://img.invalid/objek.png" }) });
+    Wu.kv.set("premium:22001", new Date(Date.now() + 86400000).toISOString());
+    await handleUpdate(Wu.io, msg(22001, "/ai"));
+    await handleUpdate(Wu.io, cb(22001, "ai:task:image"));
+    await handleUpdate(Wu.io, msg(22001, "a red balloon"));
+    cek("cabang: hasil {url} -> sendPhoto URL, sendPhotoBytes tidak dipakai",
+        Wu.photos.length === 1 &&
+        Wu.photos[0].url === "https://img.invalid/objek.png" &&
+        Wu.photoBytes.length === 0, JSON.stringify(Wu.photos));
+    const Wb2 = buatIo({ ai: AI_IMG20,
+      genImage: async () => ({ bytesBase64: B64_PNG, mimeType: "image/jpeg" }) });
+    Wb2.kv.set("premium:22002", new Date(Date.now() + 86400000).toISOString());
+    await handleUpdate(Wb2.io, msg(22002, "/ai"));
+    await handleUpdate(Wb2.io, cb(22002, "ai:task:image"));
+    await handleUpdate(Wb2.io, msg(22002, "a blue balloon"));
+    cek("cabang: hasil {bytesBase64} -> sendPhotoBytes dengan mime hasil, sendPhoto URL tidak dipakai",
+        Wb2.photoBytes.length === 1 &&
+        Wb2.photoBytes[0].base64 === B64_PNG &&
+        Wb2.photoBytes[0].mimeType === "image/jpeg" &&
+        Wb2.photos.length === 0, JSON.stringify(Wb2.photoBytes));
+  } finally {
+    globalThis.fetch = fetchAsli;
+  }
 }
 
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);

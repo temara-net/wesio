@@ -251,3 +251,72 @@ invoice 250 Stars kepadanya). Kini di worker/worker.js:
 - Perilaku di layanan asli (Worker live belum menerima deploy
   putaran ini — di luar lingkup tugas; push/deploy menunggu agen
   induk). Uji di atas adalah bukti lokal dengan io tiruan.
+
+# Tambahan 1 Nov 2026 — Fitur gambar diperbaiki untuk Gemini (endpoint natif + foto multipart)
+
+Temuan dari kode yang lama: (1) `AI_IMAGE_MODEL` belum pernah
+terpasang di Worker live sehingga `io.ai.imageModel` kosong dan
+fitur Image jalur sistem mati di gerbang "not switched on yet"
+(perilaku gerbang itu sendiri sudah benar dan dipertahankan);
+(2) lebih mendasar, `genImage` lama POST ke
+`{AI_BASE_URL}/images/generations` (bentuk OpenAI) dan mengharap
+`data[0].url` — endpoint kompatibel-OpenAI milik Google Gemini
+tidak menyediakan jalur itu. Gambar Gemini berjalan lewat endpoint
+natif `…/v1beta/models/<model>:generateContent` dan hasilnya
+kembali sebagai base64 `inlineData`, bukan URL.
+
+Perubahan di worker/worker.js (adapter `buatIo` + cabang Image):
+- `genImage`: bila basis AI Google (baseUrl mengandung
+  "googleapis.com") ATAU model gambar diawali "gemini", panggil
+  endpoint natif generateContent dengan model dari env
+  `AI_IMAGE_MODEL` (tidak di-hardcode), body
+  `contents[{parts:[{text: prompt}]}]` +
+  `generationConfig.responseModalities ["TEXT","IMAGE"]`, kunci
+  sistem yang sama di header `x-goog-api-key`; urai `inlineData`
+  pertama → kembalikan `{bytesBase64, mimeType}`. Basis non-Google
+  tetap jalur lama `/images/generations` → kini mengembalikan
+  `{url}`. Kegagalan HTTP tercatat statusnya di log konsol internal
+  (kedua jalur); pesan ke pengguna tetap kalimat manusia yang sudah
+  ada, tanpa teks teknis.
+- Adapter menambah `io.sendPhotoBytes(chatId, base64, mimeType,
+  caption)`: kirim foto sebagai multipart/form-data (FormData:
+  chat_id, caption, photo sebagai Blob dari dekode base64, nama
+  berkas image.png / image.jpg sesuai mime). Cabang tugas Image di
+  `prosesAi` memilih jalur dari bentuk hasil `genImage`:
+  `{bytesBase64}` → sendPhotoBytes; `{url}`/string → sendPhoto URL
+  yang lama. Kuota gambar, gerbang Premium/admin, dan perilaku lain
+  tidak berubah. `buatIo` kini diekspor agar harness bisa menguji
+  adapter asli dengan fetch tiruan.
+
+## Hasil uji putaran ini (dijalankan di mesin ini)
+- `node tests/run_worker_test.mjs` → **165 lulus, 0 gagal** = 146
+  uji lama (regresi utuh; juga dijalankan di tengah perubahan,
+  tetap 146/146 sebelum uji baru ditambah) + 19 uji baru bagian 20
+  memakai ADAPTER ASLI dengan fetch tiruan dan KV Map:
+  (a) basis Google → genImage memanggil URL natif
+  `:generateContent` dengan model dari env, body contents +
+  responseModalities benar, kunci di header, tanpa panggilan
+  /images/generations; inlineData terurai dan cabang Image mengirim
+  sendPhoto multipart (FormData berisi berkas PNG 8 byte bertipe
+  image/png); kuota gambar admin tidak terpotong, pengguna Premium
+  terpotong tepat 1 (sisa tampil 19 of 20); (b) basis non-Google →
+  jalur `/images/generations` lama tetap dipakai (model dari env)
+  dan foto dikirim via sendPhoto URL (JSON); (c) respons Gemini
+  tanpa inlineData → pesan gagal manusiawi "picture maker is busy",
+  tanpa sendPhoto, kuota utuh, tanpa teks teknis ke pengguna;
+  (d) pemilihan cabang dari bentuk hasil diuji juga pada io tiruan
+  ({url} → URL, {bytesBase64} → bytes).
+- `python3 tests/run_executor_test.py` → **12 lulus, 0 gagal**
+  (regresi). `node --check worker/worker.js` → OK. Audit nama
+  pribadi di worker/ + tests/ → 0 temuan.
+
+## Belum terbukti untuk tambahan ini
+- Nilai secret `AI_IMAGE_MODEL` di Worker live BELUM terpasang —
+  pemasangannya adalah langkah pengelola sesudah putaran ini
+  (direncanakan gemini-2.5-flash-image); selama env itu kosong,
+  fitur Image jalur sistem tetap menjawab "not switched on yet"
+  dengan jujur.
+- Perilaku endpoint natif Gemini ASLI (bentuk respons generateContent
+  nyata, kuota model gambar) dan pengiriman multipart ke Bot API
+  asli — harness lokal memakai fetch tiruan; belum di-push dan
+  belum di-deploy (menunggu agen induk).

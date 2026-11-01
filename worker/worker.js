@@ -473,9 +473,18 @@ async function prosesAi(io, chatId, uid, teks) {
     }
     await io.send(chatId, "🎨 Creating your picture…");
     try {
-      const url = await io.genImage(teks);
+      const hasil = await io.genImage(teks);
       if (!admin) await kuotaTambah(io, uid, "aimg");
-      await io.sendPhoto(chatId, url, "Here is your picture 🎨");
+      if (hasil && typeof hasil === "object" && hasil.bytesBase64) {
+        // Gemini returns the picture as base64 bytes: it goes to
+        // Telegram as a multipart file upload, not as a URL.
+        await io.sendPhotoBytes(chatId, hasil.bytesBase64,
+          hasil.mimeType || "image/png", "Here is your picture 🎨");
+      } else {
+        const url = typeof hasil === "string" ? hasil : (hasil && hasil.url);
+        if (!url) throw new Error("Image empty answer");
+        await io.sendPhoto(chatId, url, "Here is your picture 🎨");
+      }
       await io.send(chatId,
         admin
           ? "👑 Owner: unlimited — no daily image limit for your account."
@@ -1397,7 +1406,9 @@ export async function handleUpdate(io, update) {
 }
 
 // ---------------- Cloudflare adapter ----------------
-function buatIo(env) {
+// Exported so the local test harness can drive the real adapter
+// (genImage / sendPhotoBytes) with a stubbed fetch and a Map-backed KV.
+export function buatIo(env) {
   const base = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/`;
   const tg = async (method, body) => {
     const r = await fetch(base + method, {
@@ -1440,6 +1451,23 @@ function buatIo(env) {
     },
     sendPhoto: async (chatId, url, caption) => {
       await tg("sendPhoto", { chat_id: chatId, photo: url, caption });
+    },
+    sendPhotoBytes: async (chatId, base64, mimeType, caption) => {
+      // Telegram has no base64 field for photos: raw bytes must go as
+      // a multipart/form-data file upload.
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const mime = mimeType || "image/png";
+      const nama = mime.includes("jpeg") || mime.includes("jpg")
+        ? "image.jpg" : "image.png";
+      const form = new FormData();
+      form.append("chat_id", String(chatId));
+      if (caption) form.append("caption", caption);
+      form.append("photo", new Blob([bytes], { type: mime }), nama);
+      const r = await fetch(base + "sendPhoto", { method: "POST", body: form });
+      if (!r.ok) throw new Error("Telegram sendPhoto HTTP " + r.status);
+      return r;
     },
     sendInvoice: async (chatId, inv) => {
       await tg("sendInvoice", {
@@ -1526,6 +1554,41 @@ function buatIo(env) {
       return { ok: false, reason: "unreachable" };
     },
     genImage: async (prompt) => {
+      const model = env.AI_IMAGE_MODEL || "";
+      const google = aiBase.includes("googleapis.com") ||
+        model.startsWith("gemini");
+      if (google) {
+        // Gemini's OpenAI-compatible endpoint has no
+        // /images/generations: image models answer on the native
+        // generateContent endpoint and hand the picture back as
+        // base64 inlineData inside the reply parts — never a URL.
+        const r = await fetch(
+          "https://generativelanguage.googleapis.com/v1beta/models/" +
+            model + ":generateContent", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": env.AI_API_KEY,
+            },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+            }),
+          });
+        if (!r.ok) {
+          console.log("genImage Gemini gagal, HTTP " + r.status);
+          const err = new Error("Image HTTP " + r.status);
+          err.status = r.status;
+          throw err;
+        }
+        const data = await r.json();
+        const parts =
+          (((data.candidates || [])[0] || {}).content || {}).parts || [];
+        const img = parts.find(p => p && p.inlineData && p.inlineData.data);
+        if (!img) throw new Error("Image empty answer");
+        return { bytesBase64: img.inlineData.data,
+                 mimeType: img.inlineData.mimeType || "image/png" };
+      }
       const r = await fetch(aiBase + "/images/generations", {
         method: "POST",
         headers: {
@@ -1534,11 +1597,16 @@ function buatIo(env) {
         },
         body: JSON.stringify({ model: env.AI_IMAGE_MODEL, prompt, n: 1 }),
       });
-      if (!r.ok) throw new Error("Image HTTP " + r.status);
+      if (!r.ok) {
+        console.log("genImage gagal, HTTP " + r.status);
+        const err = new Error("Image HTTP " + r.status);
+        err.status = r.status;
+        throw err;
+      }
       const data = await r.json();
       const item = data.data && data.data[0];
       if (!item || !item.url) throw new Error("Image empty answer");
-      return item.url;
+      return { url: item.url };
     },
     dispatch: async (jobId) => {
       const r = await fetch(
