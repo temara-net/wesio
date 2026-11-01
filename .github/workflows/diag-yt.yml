@@ -8,11 +8,19 @@ jobs:
         with: { python-version: "3.12" }
       - name: Install yt-dlp
         run: pip install -q "yt-dlp>=2024.8.6"
-      - name: Shorts sehat - perintah produksi persis
+      - name: Shorts sehat - tiga probe
+        shell: bash
         run: |
-          echo "ffmpeg: $(command -v ffmpeg || echo TIDAK-ADA)"
+          set +e
+          U="https://www.youtube.com/shorts/BCaCmDrc_mM"
+          echo "=== A) metadata -j"
+          timeout 60 python3 -m yt_dlp -j --no-warnings "$U" > /tmp/j.txt 2> /tmp/e1.txt; echo "rc=$?"
+          head -c 150 /tmp/j.txt; echo; cat /tmp/e1.txt
+          echo "=== B) unduh format gabungan (produksi)"
           rm -rf /tmp/dl && mkdir -p /tmp/dl
-          timeout 240 python3 -m yt_dlp -f "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" --merge-output-format mp4 --max-filesize 50M --no-playlist --no-warnings -o "/tmp/dl/%(title).80s.%(ext)s" "https://www.youtube.com/shorts/BCaCmDrc_mM" > /tmp/out.txt 2> /tmp/err.txt; echo "rc=$?"
-          echo "--- stdout:"; cat /tmp/out.txt
-          echo "--- stderr:"; cat /tmp/err.txt
-          echo "--- berkas:"; ls -la /tmp/dl/
+          timeout 240 python3 -m yt_dlp -f "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" --merge-output-format mp4 --max-filesize 50M --no-playlist --no-warnings -o "/tmp/dl/%(title).80s.%(ext)s" "$U" > /tmp/o2.txt 2> /tmp/e2.txt; echo "rc=$?"
+          cat /tmp/o2.txt; cat /tmp/e2.txt; ls -la /tmp/dl/
+          echo "=== C) unduh format progresif tunggal"
+          rm -rf /tmp/dl2 && mkdir -p /tmp/dl2
+          timeout 240 python3 -m yt_dlp -f "b[height<=720]/b" --max-filesize 50M --no-playlist --no-warnings -o "/tmp/dl2/%(title).80s.%(ext)s" "$U" > /tmp/o3.txt 2> /tmp/e3.txt; echo "rc=$?"
+          cat /tmp/o3.txt; cat /tmp/e3.txt; ls -la /tmp/dl2/
