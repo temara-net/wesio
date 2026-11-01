@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: read
+  actions: write # eksekutor memicu ulang workflow ini untuk retry bot-check
 
 concurrency:
   group: wesio-eksekusi
@@ -34,6 +35,13 @@ jobs:
       - name: Pasang dependensi
         run: pip install -r executor/requirements.txt
 
+      # ffmpeg TIDAK terpasang bawaan di runner — tanpa ini yt-dlp
+      # tidak bisa menggabungkan video+audio (bv*+ba) menjadi mp4.
+      - name: Pasang ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
       - name: Jalankan eksekutor job
         env:
           JOB_ID: ${{ inputs.job_id }}
@@ -41,4 +49,8 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NS_ID: ${{ secrets.CF_KV_NS_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          # Token bawaan run untuk retry bot-check (picu ulang workflow
+          # ini dari job baru = IP runner baru).
+          GH_TOKEN_JOB: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO_JOB: ${{ github.repository }}
         run: python -m executor.executor_job

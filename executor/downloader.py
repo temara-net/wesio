@@ -2,7 +2,11 @@
 
 Hasil selalu berbentuk dict:
   {"ok": True, "path": ..., "title": ..., "size_mb": ...}
-  {"ok": False, "alasan": "too_big" | "unavailable"}
+  {"ok": False, "alasan": "too_big" | "unavailable" | "botcheck"}
+
+Alasan "botcheck": platform (YouTube) menolak IP server eksekutor
+dengan pemeriksaan "apakah kamu bot" — kegagalannya per-IP dan sering
+lolos pada percobaan ulang dari job Actions baru (IP berganti).
 
 Pesan untuk pengguna disusun oleh executor_job dari kode alasan ini —
 teks error mentah yt-dlp TIDAK pernah diteruskan ke pengguna.
@@ -25,6 +29,24 @@ def _berkas_hasil(folder: str) -> str | None:
     if not calon:
         return None
     return max(calon, key=os.path.getsize)
+
+
+def _alasan_dari_stderr(stderr: str) -> str:
+    err = (stderr or "").lower()
+    if "sign in to confirm" in err or "not a bot" in err:
+        return "botcheck"
+    if "file is larger" in err or "max-filesize" in err:
+        return "too_big"
+    return "unavailable"
+
+
+def _log_stderr_aman(stderr: str, url: str) -> None:
+    """Cetak maks 3 baris ekor stderr yt-dlp ke log Actions supaya
+    kegagalan bisa didiagnosis, dengan URL job disamarkan menjadi
+    '[url]' — teks error provider selebihnya aman untuk log."""
+    baris = [b for b in (stderr or "").splitlines() if b.strip()]
+    for b in baris[-3:]:
+        print(f"[downloader] stderr: {b.replace(url, '[url]')[:300]}")
 
 
 def _unduh_dryrun(fmt: str, folder: str) -> dict:
@@ -58,9 +80,8 @@ def _unduh_ytdlp(url: str, fmt: str, folder: str) -> dict:
         return {"ok": False, "alasan": "unavailable"}
     path = _berkas_hasil(folder)
     if path is None:
-        err = (p.stderr or "").lower()
-        alasan = "too_big" if "file is larger" in err or "max-filesize" in err \
-            else "unavailable"
+        alasan = _alasan_dari_stderr(p.stderr or "")
+        _log_stderr_aman(p.stderr or "", url)
         print(f"[downloader] gagal rc={p.returncode} alasan={alasan}")
         return {"ok": False, "alasan": alasan}
     ukuran = os.path.getsize(path)

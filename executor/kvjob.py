@@ -1,4 +1,5 @@
-"""Klien Cloudflare KV (REST API) untuk mengambil JOB WesioBot.
+"""Klien Cloudflare KV (REST API) untuk mengambil JOB WesioBot —
+plus menulisnya kembali bila job perlu dicoba ulang (retry bot-check).
 
 Job ditulis Worker webhook sebagai kunci 'job:<id>' berisi JSON
 {type, chat_id, uid, url, format}. Job ber-TTL 15 menit di KV dan
@@ -29,6 +30,18 @@ def ambil_job(job_id: str) -> dict | None:
         return None
     r.raise_for_status()
     return json.loads(r.text)
+
+
+def simpan_job(job_id: str, job: dict, ttl: int = 900) -> None:
+    """Tulis (kembali) sebuah job ke KV — dipakai jalur retry lintas
+    job: job yang gagal bot-check disimpan lagi dengan cacah percobaan
+    bertambah, lalu workflow dipicu ulang untuk job_id yang sama."""
+    r = requests.put(_basis() + "job:" + job_id,
+                     params={"expiration_ttl": ttl},
+                     headers={**_headers(),
+                              "Content-Type": "application/json"},
+                     data=json.dumps(job), timeout=30)
+    r.raise_for_status()
 
 
 def hapus_job(job_id: str) -> None:

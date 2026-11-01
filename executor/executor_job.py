@@ -7,12 +7,25 @@ ke chat pengguna. Semua pesan ke pengguna berbahasa Inggris, kalimat
 manusia — teks error teknis tidak pernah diteruskan.
 
 Env wajib: JOB_ID, TG_BOT_TOKEN, CF_ACCOUNT_ID, CF_KV_NS_ID, CF_API_TOKEN.
-Env opsional: TG_API_BASE & CF_API_BASE (uji lokal), DOWNLOADER_MODE
-(ytdlp | dryrun | fail — dua terakhir untuk uji lokal).
+Env opsional: TG_API_BASE & CF_API_BASE & GH_API_BASE (uji lokal),
+DOWNLOADER_MODE (ytdlp | dryrun | fail — dua terakhir untuk uji lokal),
+GH_TOKEN_JOB & GH_REPO_JOB (token + repo untuk memicu ulang execute.yml
+pada retry bot-check; diisi execute.yml dari GITHUB_TOKEN bawaan run).
+
+Retry bot-check: YouTube menolak IP runner GitHub secara per-IP, jadi
+unduhan YouTube yang gagal alasan "botcheck" dicoba ulang otomatis
+dari job Actions BARU (IP baru) — maks 3 percobaan total per job.
+Job disimpan kembali ke KV dengan field 'attempts' bertambah lalu
+execute.yml dipicu ulang untuk job_id yang sama, TANPA pesan ke
+pengguna. Kuota TIDAK disentuh eksekutor sama sekali (dipotong Worker
+saat dispatch awal), jadi retry tidak pernah memotong kuota dua kali.
 """
 import os
 import sys
 import tempfile
+from urllib.parse import urlparse
+
+import requests
 
 from . import kvjob
 from .downloader import unduh
@@ -25,7 +38,75 @@ PESAN_GAGAL = {
     "unavailable": ("I couldn't download that link. The post may be "
                     "private or removed, or the platform refused the "
                     "request. Please check the link and try again."),
+    "botcheck": ("YouTube is asking our server to prove it isn't a bot "
+                 "right now, so this download was blocked by YouTube "
+                 "itself. Please try again in a little while — it "
+                 "often works on a later attempt."),
 }
+
+MAKS_PERCOBAAN = 3  # total percobaan per job, termasuk yang pertama
+
+
+def _host_youtube(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return (host == "youtube.com" or host.endswith(".youtube.com")
+            or host == "youtu.be" or host.endswith(".youtu.be"))
+
+
+def _picu_ulang(job_id: str) -> bool:
+    """Picu ulang workflow execute.yml untuk job_id yang sama memakai
+    token bawaan run (GITHUB_TOKEN via env GH_TOKEN_JOB)."""
+    token = os.environ.get("GH_TOKEN_JOB", "")
+    repo = os.environ.get("GH_REPO_JOB", "")
+    if not token or not repo:
+        print("[executor_job] GH_TOKEN_JOB/GH_REPO_JOB kosong; "
+              "retry tidak bisa dipicu")
+        return False
+    base = os.environ.get("GH_API_BASE", "https://api.github.com")
+    r = requests.post(
+        f"{base}/repos/{repo}/actions/workflows/execute.yml/dispatches",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json"},
+        json={"ref": "main", "inputs": {"job_id": job_id}}, timeout=30)
+    if r.status_code != 204:
+        print(f"[executor_job] picu ulang gagal HTTP {r.status_code}")
+        return False
+    return True
+
+
+def _coba_retry(job_id: str, job: dict) -> bool:
+    """Simpan job kembali (attempts+1) lalu picu ulang. True bila retry
+    berhasil dijadwalkan — pemanggil lalu TIDAK mengirim pesan gagal
+    dan TIDAK menutup job sebagai selesai."""
+    try:
+        attempts = int(job.get("attempts", 0) or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts + 1 >= MAKS_PERCOBAAN:
+        return False
+    job_baru = dict(job)
+    job_baru["attempts"] = attempts + 1
+    try:
+        kvjob.simpan_job(job_id, job_baru)
+    except Exception as e:
+        print(f"[executor_job] simpan job untuk retry gagal: {e}")
+        return False
+    try:
+        terpicu = _picu_ulang(job_id)
+    except Exception as e:
+        print(f"[executor_job] picu ulang error: {e}")
+        terpicu = False
+    if not terpicu:
+        # Job tersimpan tapi tidak akan ada yang menjalankannya —
+        # bersihkan lagi; pemanggil mengirim pesan gagal ke pengguna.
+        kvjob.hapus_job(job_id)
+        return False
+    print(f"[executor_job] botcheck: job {job_id} dijadwalkan ulang "
+          f"(percobaan {attempts + 2} dari {MAKS_PERCOBAAN})")
+    return True
 
 
 def _kirim_berkas(tg: Telegram, chat_id, fmt: str, path: str, judul: str) -> None:
@@ -42,16 +123,20 @@ def _kirim_berkas(tg: Telegram, chat_id, fmt: str, path: str, judul: str) -> Non
         tg.send_document(chat_id, path, caption=caption)
 
 
-def proses_download(tg: Telegram, job: dict) -> None:
+def proses_download(tg: Telegram, job: dict, job_id: str = "") -> None:
     chat_id = job["chat_id"]
     url = job.get("url", "")
     fmt = job.get("format", "video")
     with tempfile.TemporaryDirectory() as folder:
         hasil = unduh(url, fmt, folder)
         if not hasil.get("ok"):
+            alasan = hasil.get("alasan")
+            if (alasan == "botcheck" and _host_youtube(url)
+                    and _coba_retry(job_id, job)):
+                return  # dijadwalkan ulang; pengguna tidak diberi pesan
             tg.send_message(chat_id, PESAN_GAGAL.get(
-                hasil.get("alasan"), PESAN_GAGAL["unavailable"]))
-            print(f"[executor_job] unduh gagal alasan={hasil.get('alasan')}")
+                alasan, PESAN_GAGAL["unavailable"]))
+            print(f"[executor_job] unduh gagal alasan={alasan}")
             return
         try:
             _kirim_berkas(tg, chat_id, fmt, hasil["path"], hasil.get("title", ""))
@@ -79,7 +164,7 @@ def main() -> int:
 
     if job.get("type") == "download":
         try:
-            proses_download(tg, job)
+            proses_download(tg, job, job_id)
         except Exception as e:
             print(f"[executor_job] proses download error: {e}")
             try:

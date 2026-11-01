@@ -479,3 +479,88 @@ muka — padahal mesin yt-dlp di eksekutor mendukung 1.000+ situs.
   penerimaan tautan di Worker terbukti lokal, keberhasilan unduh
   per situs tetap bergantung penolakan/pembatasan situs itu
   sendiri dan dilaporkan apa adanya oleh eksekutor.
+
+---
+
+## Penguatan eksekutor unduhan (1 Nov 2026)
+
+Latar terbukti dari diagnostik runner asli (agen induk, 1 Nov):
+(1) ffmpeg TIDAK terpasang di runner ubuntu-latest sehingga perintah
+produksi bv*+ba + --merge-output-format mp4 tidak bisa menggabungkan
+video+audio dengan benar; (2) YouTube menolak IP runner GitHub dengan
+stderr persis "Sign in to confirm you're not a bot" pada semua klien
+yt-dlp — penolakan per-IP (IP berganti tiap job), penyebab kegagalan
+"unavailable" YouTube selama ini, sedangkan TikTok lolos; (3) eksekutor
+membuang stderr yt-dlp sehingga kegagalan tak terdiagnosis dari log.
+
+### Perubahan (HANYA executor/*.py + execute.yml; worker.js tidak disentuh)
+
+1. execute.yml: langkah baru "Pasang ffmpeg" (apt-get update -qq &&
+   apt-get install -y -qq ffmpeg, dengan sudo sesuai kebutuhan runner)
+   SEBELUM langkah eksekutor; `permissions` ditambah `actions: write`;
+   langkah eksekutor kini meneruskan GH_TOKEN_JOB (secrets.GITHUB_TOKEN
+   bawaan run) + GH_REPO_JOB (github.repository) untuk retry.
+2. downloader.py: klasifikasi stderr baru `_alasan_dari_stderr` —
+   "sign in to confirm"/"not a bot" → alasan baru "botcheck"; pola
+   filesize tetap "too_big"; sisanya "unavailable". Perintah yt-dlp
+   yang dibangun TIDAK berubah. Saat gagal, maks 3 baris ekor stderr
+   dicetak ke log Actions dengan kemunculan persis URL job disamarkan
+   menjadi "[url]" (`_log_stderr_aman`) — cukup untuk diagnosis tanpa
+   meneruskan tautan pengguna melebihi teks error provider.
+3. kvjob.py: `simpan_job(job_id, job, ttl=900)` (PUT + expiration_ttl)
+   untuk menulis kembali job yang akan dicoba ulang.
+4. executor_job.py: PESAN_GAGAL["botcheck"] baru, jujur khusus
+   YouTube: "YouTube is asking our server to prove it isn't a bot
+   right now, so this download was blocked by YouTube itself. Please
+   try again in a little while — it often works on a later attempt."
+   Retry lintas job: kegagalan "botcheck" pada host youtube.com /
+   youtu.be (termasuk subdomain) dengan percobaan < 3 → job disimpan
+   kembali ke KV (field `attempts` +1), execute.yml dipicu ulang via
+   API GitHub untuk job_id yang sama (IP runner baru), TANPA pesan
+   gagal ke pengguna dan TANPA menutup job. Percobaan ke-3 gagal →
+   pesan botcheck terkirim, job ditutup seperti alur gagal biasa.
+   Bila simpan/picu ulang gagal di tengah, eksekutor kembali ke alur
+   gagal biasa (pesan terkirim) — pengguna tidak pernah menggantung.
+   Job non-YouTube atau alasan lain tidak di-retry; perilaku sukses
+   dan alasan lain tidak berubah.
+
+### Temuan kuota pada retry
+
+Eksekutor TIDAK menyentuh kuota sama sekali — grep "quota|kuota" di
+executor/ dan execute.yml = 0 temuan; tidak ada field kuota di record
+job yang dibaca eksekutor. Kuota dipotong Worker saat dispatch awal.
+Retry memicu ulang execute.yml langsung (bukan lewat Worker) untuk
+job_id yang sama, jadi TIDAK ada pemotongan kedua. Aman secara desain,
+bukan sekadar dijaga di kode retry.
+
+### Hasil uji putaran ini (dijalankan di mesin ini)
+
+- Baseline: eksekutor 12/12, Worker 199/199.
+- `python3 tests/run_executor_test.py` → **38 lulus, 0 gagal** =
+  12 lama utuh + 26 baru (bagian 5–10, yt-dlp tiruan via patch
+  subprocess.run + KV/GitHub API tiruan): botcheck attempts 0 →
+  alasan botcheck, redispatch 1x dengan job_id sama, record attempts
+  0→1, nol pesan ke pengguna; attempts 1 → redispatch lagi,
+  attempts→2; attempts 2 (percobaan ke-3) → pesan botcheck terkirim,
+  tanpa redispatch, job ditutup; botcheck non-YouTube → tanpa retry,
+  pesan sesuai pemetaan; unavailable biasa → tanpa retry, pesan lama;
+  log diagnostik memuat "[url]", TIDAK memuat URL asli, maks 3 baris;
+  perintah yt-dlp terbukti tidak berubah; execute.yml memuat langkah
+  ffmpeg sebelum langkah eksekutor + actions: write + GH_TOKEN_JOB.
+- `node tests/run_worker_test.mjs` → **199 lulus, 0 gagal** (tidak
+  disentuh). YAML execute.yml lolos parse. Grep nama pribadi di
+  berkas yang diubah → 0 temuan.
+
+### Belum terbukti untuk tambahan ini
+
+- Perilaku di layanan asli — belum di-push/di-deploy (menunggu picu
+  agen induk). Yang belum teramati live: pemasangan ffmpeg di runner
+  asli benar-benar membuat merge bv*+ba menghasilkan satu mp4;
+  redispatch via GITHUB_TOKEN benar-benar diterima API GitHub dari
+  dalam run (izin actions: write pada token bawaan); dan apakah IP
+  job berikutnya benar-benar lolos bot-check YouTube (sifatnya
+  peluang per-IP, bukan jaminan — pesan botcheck tetap jalan keluar
+  jujurnya sesudah 3 percobaan).
+- Penyamaran log hanya mengganti kemunculan PERSIS string URL job;
+  stderr yt-dlp yang menyebut ID video tanpa URL penuh tetap tampil
+  apa adanya di log (sesuai rancangan: cukup untuk diagnosis).
