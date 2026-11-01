@@ -310,13 +310,49 @@ async function sisaDl(io, uid, prem) {
 // ordered fallback chain and the last model that worked. Reading code
 // falls back to the provider default for records without a chain.
 
+// The version inside a Gemini model id: "gemini-<major>.<minor>…"
+// → [major, minor]; null when the id carries no parseable version.
+function versiModelGemini(id) {
+  const m = /gemini-(\d+)[.](\d+)/.exec(String(id).toLowerCase());
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
+// Owner rule: the NEWEST model is always tried first. Flash models
+// keep their group lead (they carry the free tier); inside a group,
+// versioned ids sort by version descending (numeric major, then
+// minor — so 3.10 outranks 3.5), and ids without a parseable version
+// stay at the tail in their original relative order. The sort is
+// stable and idempotent: re-sorting a sorted chain changes nothing.
+function urutkanModelGemini(daftar) {
+  return daftar
+    .map((id, i) => ({ id, i,
+      flash: String(id).toLowerCase().includes("flash"),
+      v: versiModelGemini(id) }))
+    .sort((a, b) => {
+      if (a.flash !== b.flash) return a.flash ? -1 : 1;
+      if (a.v && b.v) {
+        if (a.v[0] !== b.v[0]) return b.v[0] - a.v[0];
+        if (a.v[1] !== b.v[1]) return b.v[1] - a.v[1];
+      } else if (a.v) return -1;
+      else if (b.v) return 1;
+      return a.i - b.i;
+    })
+    .map(x => x.id);
+}
+
 // The model chain saved with a user's key (or the single fallback
 // model for older/manual records).
 function rantaiModelKunci(kunci) {
   if (Array.isArray(kunci.models)) {
     const rantai = kunci.models.filter(m =>
       typeof m === "string" && m.trim());
-    if (rantai.length) return rantai;
+    if (rantai.length) {
+      // Gemini chains are always read newest-first (owner rule), so
+      // even records saved earlier — or in provider order — try the
+      // newest model first.
+      return kunci.provider === "gemini"
+        ? urutkanModelGemini(rantai) : rantai;
+    }
   }
   const prov = BYOK_PROVIDERS[kunci.provider];
   const tunggal = kunci.model || (prov ? prov.model : "");
@@ -327,6 +363,18 @@ function rantaiModelKunci(kunci) {
 function daftarModelSistem(io) {
   return String((io.ai && io.ai.modelFast) || "")
     .split(",").map(s => s.trim()).filter(Boolean);
+}
+
+// One answer through the system key, exactly as the pure-system path
+// does it: Premium users who picked the strong model get that single
+// direct call; everyone else walks the AI_MODEL_FAST chain.
+async function jawabLewatSistem(io, messages, c, prem) {
+  if (c.aiModel === "strong" && prem && io.ai.modelStrong) {
+    return await io.callAI(messages, io.ai.modelStrong, null);
+  }
+  const r = await panggilRantai(io, messages,
+    daftarModelSistem(io), null, 0);
+  return r.jawaban;
 }
 
 // Statuses that mean "this model cannot serve right now" — quota/rate
@@ -545,8 +593,11 @@ async function prosesAi(io, chatId, uid, teks) {
   // the user's own chain starts at the last model that worked for them
   // and remembers a new winner; the system chain starts at the first
   // entry of AI_MODEL_FAST. The strong model stays a single direct call.
+  // If the user's own chain runs COMPLETELY dry, the question falls
+  // back to the system chain instead of dead-ending (total fallback).
   const provKunci = kunci ? BYOK_PROVIDERS[kunci.provider] : null;
   let jawaban;
+  let dialihkanSistem = false;
   try {
     if (kunci) {
       const rantai = rantaiModelKunci(kunci);
@@ -558,14 +609,32 @@ async function prosesAi(io, chatId, uid, teks) {
         kunci.active = r.model;
         await io.kvPut("apikey:" + uid, JSON.stringify(kunci));
       }
-    } else if (c.aiModel === "strong" && prem && io.ai.modelStrong) {
-      jawaban = await io.callAI(messages, io.ai.modelStrong, null);
     } else {
-      const r = await panggilRantai(io, messages,
-        daftarModelSistem(io), null, 0);
-      jawaban = r.jawaban;
+      jawaban = await jawabLewatSistem(io, messages, c, prem);
     }
   } catch (e) {
+    if (kunci && e && e.semuaHabis && aiSiap(io)) {
+      // TOTAL FALLBACK (owner rule: newest model first, and when a
+      // quota runs out the bot switches by itself — never a dead
+      // end). The user's own key chain is completely dry, so the
+      // SAME question continues on the system chain. The key record
+      // is not touched: the key stays saved for later. Only quota
+      // exhaustion lands here — key problems (401/403/402) are
+      // rethrown by the chain untouched and keep their old handling.
+      try {
+        jawaban = await jawabLewatSistem(io, messages, c, prem);
+        dialihkanSistem = true;
+      } catch (e2) {
+        await io.send(chatId,
+          "⏳ I tried both your own key and the Wesio system key, " +
+          "but both are out of quota at the moment.\n\n" +
+          "Please try again later; free quotas usually reset " +
+          "daily. Your key stays saved — nothing was removed.",
+          BYOK_REMOVE_MARKUP);
+        return;
+      }
+    }
+    if (!dialihkanSistem) {
     if (kunci && e && e.semuaHabis) {
       // Every model the user's key can reach is out of quota or
       // unavailable right now — say so plainly, with the way back.
@@ -609,6 +678,7 @@ async function prosesAi(io, chatId, uid, teks) {
       "The AI is busy right now. Please try again in a moment.",
       AI_KEYBOARD);
     return;
+    }
   }
   if (!jawaban) {
     await io.send(chatId,
@@ -620,6 +690,27 @@ async function prosesAi(io, chatId, uid, teks) {
   if (riwayatBaru) {
     c.history = riwayatBaru.concat([{ role: "assistant", content: potong(jawaban, 4000) }]).slice(-20);
     await simpanConv(io, uid, c);
+  }
+  if (dialihkanSistem) {
+    // The answer came from the SYSTEM key after the user's own key
+    // ran dry: it counts against the system quota like any system
+    // answer (the owner stays exempt, as everywhere), and it carries
+    // ONE footnote line explaining the switch. This footer replaces
+    // the own-key footer, which would be wrong for this answer.
+    let kaki;
+    if (admin) {
+      kaki = "👑 Owner: unlimited";
+    } else {
+      const terpakai = await kuotaTambah(io, uid, "ai");
+      const sisaNow = Math.max(0, batasAi(prem) - terpakai);
+      kaki = `AI messages left today: ${sisaNow} of ${batasAi(prem)}`;
+    }
+    await io.send(chatId,
+      `${jawaban}\n\n—\n${kaki}\n` +
+      "ℹ️ Your own key is out of quota right now, so this answer " +
+      "used the Wesio system key. Your key stays saved.",
+      AI_KEYBOARD);
+    return;
   }
   if (kunci) {
     await io.send(chatId,
@@ -760,13 +851,7 @@ function daftarModelDeteksi(kode, models) {
       return s.includes("gemini") &&
         !/(embedding|imagen|image|tts|aqa)/.test(s);
     });
-    const skor = (id) => {
-      const s = id.toLowerCase();
-      const v = /(\d+)[.](\d+)/.exec(s);
-      const versi = v ? parseFloat(v[1] + "." + v[2]) : 0;
-      return (s.includes("flash") ? 1000 : 0) + versi;
-    };
-    const urut = [...new Set(chat)].sort((a, b) => skor(b) - skor(a));
+    const urut = urutkanModelGemini([...new Set(chat)]);
     return urut.length ? urut.slice(0, 4)
       : ["gemini-2.5-flash", "gemini-2.0-flash"];
   }

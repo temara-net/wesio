@@ -320,3 +320,84 @@ Perubahan di worker/worker.js (adapter `buatIo` + cabang Image):
   nyata, kuota model gambar) dan pengiriman multipart ke Bot API
   asli — harness lokal memakai fetch tiruan; belum di-push dan
   belum di-deploy (menunggu agen induk).
+
+# Tambahan 1 Nov 2026 — Rantai total lintas kunci + urutan Gemini terbaru dulu
+
+Aturan pemilik yang ditegaskan: prioritas model TERBARU dulu; bila
+kuota habis, OTOMATIS beralih — pengguna tidak boleh menabrak jalan
+buntu selama masih ada jalur yang hidup. Celah sebelumnya: peralihan
+antar-model dalam satu kunci sudah ada, tetapi bila SELURUH model
+pada kunci BYOK pengguna habis (e.semuaHabis), bot berhenti dan
+menyuruh pengguna melepas kuncinya manual — padahal kunci sistem
+masih hidup.
+
+Perubahan di worker/worker.js:
+- RANTAI TOTAL lintas kunci (prosesAi): bila rantai BYOK berakhir
+  semuaHabis DAN kunci sistem terkonfigurasi (aiSiap), pertanyaan
+  yang sama otomatis dilanjutkan ke rantai SISTEM lewat helper baru
+  `jawabLewatSistem` (dipakai bersama oleh jalur sistem murni:
+  pilihan Strong bagi Premium = panggilan langsung modelStrong;
+  selain itu rantai AI_MODEL_FAST). Record kunci pengguna TIDAK
+  dihapus dan TIDAK diubah. Jawaban hasil peralihan membawa tepat
+  SATU baris catatan kaki "ℹ️ Your own key is out of quota right
+  now, so this answer used the Wesio system key. Your key stays
+  saved." dan memotong kuota sistem seperti jawaban sistem biasa
+  (pemilik tetap bebas kuota); footer "Using your own API key"
+  tidak tampil untuk jawaban ini. Bila rantai sistem IKUT habis,
+  pesan yang terkirim menyebut kedua jalur sudah dicoba ("I tried
+  both your own key and the Wesio system key, but both are out of
+  quota…"), tetap manusiawi, tanpa teks teknis. Bila kunci sistem
+  TIDAK terkonfigurasi, pesan lama dipertahankan persis.
+- Kesalahan kunci BUKAN kuota (401/403 ditolak/ditangguhkan, 402
+  tanpa kredit) TIDAK dialihkan ke sistem — panggilRantai melempar
+  ulang status itu tanpa .semuaHabis, sehingga penanganan lamanya
+  berlaku persis seperti sebelumnya.
+- URUTAN GEMINI TERBARU DULU: helper baru `urutkanModelGemini` —
+  urai versi "gemini-<mayor>.<minor>" sebagai pasangan angka
+  (3.10 > 3.5, bukan parseFloat), urut menurun; model flash
+  mempertahankan keunggulan grupnya (pembawa tingkat gratis);
+  model tanpa versi yang terurai tetap di ekor dengan urutan
+  relatif asal; sort stabil dan idempoten. Dipakai di
+  `rantaiModelKunci` (provider gemini — record lama/acak pun dibaca
+  terbaru-dulu) dan di `daftarModelDeteksi` (rantai yang disimpan
+  saat deteksi kunci), menggantikan skor parseFloat yang lama.
+  Provider lain tidak berubah.
+
+Satu assertion uji lama disesuaikan dengan perilaku baru yang
+memang diperintahkan: bagian 17(b) "semua model 429" kini berharap
+3 panggilan (2 model kunci sendiri + 1 percobaan sistem) sebelum
+pesan akhir — sebelumnya 2, karena bot lama berhenti di kunci
+sendiri. Assertion pesannya ("out of quota" + "try again later")
+tidak berubah dan tetap lulus pada pesan dua-jalur yang baru.
+
+## Hasil uji putaran ini (dijalankan di mesin ini)
+- Baseline sebelum perubahan: Worker **165/165**, eksekutor
+  **12/12**. Di tengah perubahan (kode baru, sebelum uji baru):
+  164/165 — satu-satunya yang berubah adalah 17(b) di atas.
+- `node tests/run_worker_test.mjs` → **185 lulus, 0 gagal** = 165
+  uji lama (dengan penyesuaian 17(b) itu) + 20 uji baru bagian 21:
+  (a) BYOK Gemini semua 429 → jawaban datang dari rantai sistem,
+  catatan kaki peralihan tepat 1x, footer kunci sendiri tidak
+  tampil, kuota sistem terpotong (sisa 14 of 15), record kunci
+  byte-for-byte tidak berubah; (a2) Premium + Strong → peralihan
+  memakai model strong sistem; (b) BYOK 403 → TIDAK dialihkan
+  (1 panggilan, pesan kunci lama, sistem tak dipanggil);
+  (c) BYOK habis + sistem ikut habis → pesan dua jalur, tanpa
+  jawaban AI, tanpa catatan kaki, tanpa teks teknis; (c2) BYOK
+  habis + sistem tak terkonfigurasi → pesan lama persis;
+  (d) urutan rantai dari record tersimpan terbukti dari urutan
+  panggilan: 3.10 → 3.5 → 3.1 → 2.5, model tanpa-versi paling
+  belakang; (d2) rantai hasil deteksi /models tersimpan dengan
+  urutan yang sama; (e) jawaban BYOK normal → tanpa catatan kaki.
+- `python3 tests/run_executor_test.py` → **12 lulus, 0 gagal**
+  (regresi). `node --check worker/worker.js` → OK. Audit nama
+  pribadi di worker/ + tests/ → 0 temuan.
+
+## Belum terbukti untuk tambahan ini
+- Perilaku di layanan asli — putaran ini belum di-push dan belum
+  di-deploy ke Worker live (menunggu picu agen induk); bukti di
+  atas adalah uji lokal dengan io tiruan, termasuk urutan
+  panggilan dan isi KV tiruan.
+- Peralihan nyata terhadap kuota provider asli (429 sungguhan dari
+  Gemini/OpenRouter lalu jawaban dari kunci sistem sungguhan)
+  belum teramati di layanan asli.

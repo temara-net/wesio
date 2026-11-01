@@ -689,6 +689,10 @@ console.log("17) Rantai BYOK saat dipakai: 429/404 lompat otomatis, 401 berhenti
       JSON.stringify(W.aiCalls.map(a => a.model)));
 
   // (b) Semua model 429 -> pesan habis kuota yang manusiawi.
+  // CATATAN PERUBAHAN PERILAKU (rantai total): kunci sistem di Wb ini
+  // TERKONFIGURASI (AI_ON) dan ikut 429, jadi bot kini MENCOBA jalur
+  // sistem dulu sebelum menyerah — pesan akhirnya menyebut kedua
+  // jalur; cakupan lengkap perilaku baru ada di bagian 21.
   const Wb = buatIo({ ai: AI_ON, aiFailFor: () => 429 });
   Wb.kv.set("apikey:17002", JSON.stringify({
     provider: "openrouter", base: "https://openrouter.ai/api/v1",
@@ -699,8 +703,8 @@ console.log("17) Rantai BYOK saat dipakai: 429/404 lompat otomatis, 401 berhenti
       terakhir(Wb).text.includes("out of quota") &&
       terakhir(Wb).text.includes("try again later"),
       terakhir(Wb).text.slice(0, 250));
-  cek("semua model 429 -> kedua model dicoba, tanpa jawaban AI",
-      Wb.aiCalls.length === 2 &&
+  cek("semua model 429 -> 2 model kunci sendiri + 1 model sistem dicoba, tanpa jawaban AI",
+      Wb.aiCalls.length === 3 &&
       !terakhir(Wb).text.includes("Mock AI answer."), "");
 
   // (c) 401 -> TIDAK lompat model: langsung jalur error kunci lama.
@@ -1082,6 +1086,181 @@ console.log("20) Gambar: jalur Gemini natif (adapter asli + fetch tiruan), jalur
   } finally {
     globalThis.fetch = fetchAsli;
   }
+}
+
+console.log("21) Rantai TOTAL: BYOK kering -> otomatis lanjut ke kunci sistem; urutan Gemini terbaru dulu");
+{
+  const CATATAN = "Your key stays saved";
+  const hitungCatatan = (W) =>
+    semua(W).split("ℹ️ Your own key is out of quota").length - 1;
+
+  // (a) BYOK Gemini semua model 429 -> jawaban tetap datang dari
+  // rantai sistem + catatan kaki peralihan tepat satu kali + record
+  // kunci pengguna TIDAK berubah sama sekali.
+  const W = buatIo({ ai: AI_ON,
+    aiFailFor: (model, creds) => (creds ? 429 : null) });
+  const recAwal = JSON.stringify({
+    provider: "gemini",
+    base: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    key: "AIza-kering",
+    models: ["gemini-2.5-flash", "gemini-2.0-flash"],
+    active: "gemini-2.5-flash" });
+  W.kv.set("apikey:21001", recAwal);
+  await handleUpdate(W.io, msg(21001, "/ai"));
+  await handleUpdate(W.io, msg(21001, "halo"));
+  cek("BYOK kering: 2 panggilan kunci sendiri lalu 1 panggilan sistem (creds null)",
+      W.aiCalls.length === 3 &&
+      W.aiCalls.slice(0, 2).every(a => a.key === "AIza-kering") &&
+      W.aiCalls[2].key === null && W.aiCalls[2].model === "fast-1",
+      JSON.stringify(W.aiCalls.map(a => [a.model, a.key])));
+  cek("BYOK kering: jawaban AI tetap terkirim ke pengguna",
+      terakhir(W).text.includes("Mock AI answer."), terakhir(W).text.slice(0, 200));
+  cek("BYOK kering: catatan kaki peralihan muncul tepat SATU kali",
+      hitungCatatan(W) === 1 &&
+      terakhir(W).text.includes("this answer used the Wesio system key"),
+      terakhir(W).text.slice(-300));
+  cek("BYOK kering: kaki 'Using your own API key' TIDAK tampil (jawaban bukan dari kunci sendiri)",
+      !terakhir(W).text.includes("Using your own API key"), terakhir(W).text.slice(-300));
+  cek("BYOK kering: jawaban jalur sistem memotong kuota sistem (sisa 14 of 15)",
+      terakhir(W).text.includes("AI messages left today: 14 of 15") &&
+      W.kv.get(`quota:21001:ai:${hariIniUTC()}`) === "1",
+      terakhir(W).text.slice(-300));
+  cek("BYOK kering: record kunci TIDAK terhapus dan TIDAK berubah",
+      W.kv.get("apikey:21001") === recAwal, W.kv.get("apikey:21001") || "hilang");
+
+  // (a2) Pengguna Premium yang memilih Strong: peralihan menghormati
+  // pilihan Strong pada jalur sistem.
+  const Wp = buatIo({ ai: AI_ON,
+    aiFailFor: (model, creds) => (creds ? 429 : null) });
+  Wp.kv.set("premium:21002", new Date(Date.now() + 86400000).toISOString());
+  Wp.kv.set("apikey:21002", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-kering", models: ["a:free"], active: "a:free" }));
+  await handleUpdate(Wp.io, msg(21002, "/ai"));
+  await handleUpdate(Wp.io, cb(21002, "ai:model:strong"));
+  await handleUpdate(Wp.io, msg(21002, "halo strong"));
+  cek("BYOK kering + Premium Strong: sistem menjawab memakai model strong",
+      Wp.aiCalls.length === 2 &&
+      Wp.aiCalls[1].model === "strong-1" && Wp.aiCalls[1].key === null &&
+      terakhir(Wp).text.includes("Mock AI answer."),
+      JSON.stringify(Wp.aiCalls.map(a => a.model)));
+  cek("BYOK kering + Premium Strong: catatan kaki peralihan tampil satu kali",
+      hitungCatatan(Wp) === 1, terakhir(Wp).text.slice(-300));
+
+  // (b) BYOK 403 (kunci ditolak) -> TIDAK dialihkan: pesan kunci lama,
+  // sistem tidak pernah dipanggil, tidak ada lompatan model.
+  const Wb = buatIo({ ai: AI_ON, byokFailStatus: 403 });
+  Wb.kv.set("apikey:21003", JSON.stringify({
+    provider: "gemini",
+    base: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    key: "AIza-ditangguhkan", models: ["g-a", "g-b"], active: "g-a" }));
+  await handleUpdate(Wb.io, msg(21003, "/ai"));
+  await handleUpdate(Wb.io, msg(21003, "halo"));
+  cek("403: hanya SATU panggilan, selalu berkunci pengguna (sistem tak dipanggil)",
+      Wb.aiCalls.length === 1 &&
+      Wb.aiCalls.every(a => a.key === "AIza-ditangguhkan"),
+      JSON.stringify(Wb.aiCalls.map(a => [a.model, a.key])));
+  cek("403: pesan error kunci seperti sebelumnya, tanpa jawaban AI",
+      terakhir(Wb).text.includes("answered with an error for your own API key") &&
+      !terakhir(Wb).text.includes("Mock AI answer."),
+      terakhir(Wb).text.slice(0, 200));
+  cek("403: tanpa catatan kaki peralihan",
+      hitungCatatan(Wb) === 0, "");
+
+  // (c) BYOK habis + sistem ikut habis -> pesan habis DUA jalur,
+  // tanpa jawaban AI dan tanpa catatan kaki peralihan.
+  const Wc = buatIo({ ai: AI_ON, aiFailFor: () => 429 });
+  Wc.kv.set("apikey:21004", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-habis-total", models: ["a:free", "b:free"], active: "a:free" }));
+  await handleUpdate(Wc.io, msg(21004, "/ai"));
+  await handleUpdate(Wc.io, msg(21004, "halo"));
+  cek("dua jalur habis: pesan menyebut kunci sendiri DAN kunci sistem sudah dicoba",
+      terakhir(Wc).text.includes("both your own key and the Wesio system key") &&
+      terakhir(Wc).text.includes("out of quota") &&
+      terakhir(Wc).text.includes(CATATAN),
+      terakhir(Wc).text.slice(0, 300));
+  cek("dua jalur habis: 2 panggilan kunci sendiri + 1 sistem, tanpa jawaban AI",
+      Wc.aiCalls.length === 3 &&
+      !semua(Wc).includes("Mock AI answer."), String(Wc.aiCalls.length));
+  cek("dua jalur habis: tanpa catatan kaki peralihan, tanpa teks teknis",
+      hitungCatatan(Wc) === 0 &&
+      !/HTTP \d|Error/.test(terakhir(Wc).text), terakhir(Wc).text.slice(0, 200));
+
+  // (c2) BYOK habis + sistem TIDAK terkonfigurasi -> perilaku lama
+  // persis (pesan habis kunci sendiri + tawaran lepas kunci).
+  const Wd = buatIo({ ai: AI_OFF,
+    aiFailFor: (model, creds) => (creds ? 429 : null) });
+  Wd.kv.set("apikey:21005", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-habis-saja", models: ["a:free", "b:free"], active: "a:free" }));
+  await handleUpdate(Wd.io, msg(21005, "/ai"));
+  await handleUpdate(Wd.io, msg(21005, "halo"));
+  cek("sistem tak terkonfigurasi: pesan lama 'All the models your key can use' dipertahankan",
+      terakhir(Wd).text.includes("All the models your key can use are out of quota") &&
+      terakhir(Wd).text.includes("remove your key"),
+      terakhir(Wd).text.slice(0, 250));
+  cek("sistem tak terkonfigurasi: hanya 2 panggilan kunci sendiri (tanpa percobaan sistem)",
+      Wd.aiCalls.length === 2 &&
+      Wd.aiCalls.every(a => a.key === "sk-habis-saja"),
+      String(Wd.aiCalls.length));
+
+  // (d) Urutan rantai Gemini dari record tersimpan: versi numerik
+  // menurun, tanpa-versi paling belakang — dibuktikan dari urutan
+  // panggilan saat model-model awal kena 429.
+  const We = buatIo({ ai: AI_ON, aiFailFor: (model) =>
+    ["gemini-3.10-flash", "gemini-3.5-flash", "gemini-3.1-flash"]
+      .includes(model) ? 429 : null });
+  We.kv.set("apikey:21006", JSON.stringify({
+    provider: "gemini",
+    base: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    key: "AIza-urut",
+    models: ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-flash-latest",
+      "gemini-3.1-flash", "gemini-3.10-flash"],
+    active: "gemini-3.10-flash" }));
+  await handleUpdate(We.io, msg(21006, "/ai"));
+  await handleUpdate(We.io, msg(21006, "halo"));
+  cek("urutan Gemini: 3.10 -> 3.5 -> 3.1 -> 2.5 (minor numerik, bukan parseFloat)",
+      JSON.stringify(We.aiCalls.map(a => a.model)) === JSON.stringify(
+        ["gemini-3.10-flash", "gemini-3.5-flash", "gemini-3.1-flash",
+          "gemini-2.5-flash"]),
+      JSON.stringify(We.aiCalls.map(a => a.model)));
+  const recE = JSON.parse(We.kv.get("apikey:21006") || "{}");
+  cek("urutan Gemini: model aktif tercatat = yang berhasil (2.5), tanpa-versi belum dicoba",
+      recE.active === "gemini-2.5-flash" &&
+      !We.aiCalls.some(a => a.model === "gemini-flash-latest"),
+      recE.active || "kosong");
+
+  // (d2) Urutan yang sama berlaku saat rantai dibangun dari daftar
+  // /models pada deteksi kunci: record tersimpan sudah terbaru-dulu.
+  const Wf = buatIo({ ai: AI_ON, testKey: (base) =>
+    base.includes("googleapis")
+      ? { ok: true, models: ["gemini-2.5-flash", "gemini-3.5-flash",
+          "gemini-flash-latest", "gemini-3.1-flash"] }
+      : { ok: false, reason: "rejected" } });
+  await handleUpdate(Wf.io, cb(21007, "byok:paste"));
+  await handleUpdate(Wf.io, msg(21007, "AIza-deteksi-urut"));
+  const recF = JSON.parse(Wf.kv.get("apikey:21007") || "{}");
+  cek("deteksi Gemini: rantai tersimpan 3.5 -> 3.1 -> 2.5 -> tanpa-versi",
+      JSON.stringify(recF.models) === JSON.stringify([
+        "gemini-3.5-flash", "gemini-3.1-flash", "gemini-2.5-flash",
+        "gemini-flash-latest"]) && recF.active === "gemini-3.5-flash",
+      JSON.stringify(recF.models));
+
+  // (e) Jawaban BYOK normal -> footer kunci sendiri seperti biasa,
+  // TANPA catatan kaki peralihan.
+  const Wg = buatIo({ ai: AI_ON });
+  Wg.kv.set("apikey:21008", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-normal", models: ["a:free"], active: "a:free" }));
+  await handleUpdate(Wg.io, msg(21008, "/ai"));
+  await handleUpdate(Wg.io, msg(21008, "halo"));
+  cek("BYOK normal: jawaban + footer kunci sendiri, tanpa catatan peralihan",
+      terakhir(Wg).text.includes("Mock AI answer.") &&
+      terakhir(Wg).text.includes("Using your own API key") &&
+      hitungCatatan(Wg) === 0 &&
+      !terakhir(Wg).text.includes("AI messages left today"),
+      terakhir(Wg).text.slice(-300));
 }
 
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);
