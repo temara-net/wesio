@@ -707,3 +707,135 @@ kode Tahap 1 tanpa mengubah perilakunya. Eksekutor TIDAK disentuh.
 - getChatMember/restrict/delete/ban pada adapter asli belum teramati
   live; di uji lokal adapter grup diwakili tiruan tercatat, dan
   perilaku Worker dibuktikan terhadap tiruan itu.
+
+## Tahap 3 — Modul Anonymous Chat (1 Nov 2026)
+
+Modul terakhir sesuai konsep §7: semua 6 tombol menu kini berfungsi.
+Dibangun di atas kode live Tahap 2; eksekutor tidak disentuh.
+
+### Perubahan (worker/worker.js + tests/run_worker_test.mjs)
+
+- Adapter: `io.copyMsg(fromChatId, toChatId, messageId)` baru
+  (Bot API copyMessage) — relay anonim tanpa header forward dan
+  tanpa jejak pengirim; harness menirukannya dengan catatan
+  panggilan + opsi failCopy (pasangan memblokir bot).
+- Masuk modul (💬 Anonymous Chat atau /anon): pertama kali ->
+  sambutan + catatan keamanan (18+, identitas tidak pernah
+  ditampilkan, jangan berbagi data pribadi, Report) + tombol
+  "✅ I am 18 or older — continue"; konfirmasi tercatat sekali di
+  KV `anonprof:<uid>` (pernyataan umur tercatat, syarat konsep §7).
+  Berikutnya langsung layar Find. Pengguna ter-ban ditolak oleh
+  gerbang ban umum seperti modul lain; modul mati -> pesan
+  "temporarily off" seperti biasa.
+- Layar Find: 🔍 Find Partner (Anyone) selalu tersedia;
+  🌐 Same language — English / Indonesian adalah fitur Premium
+  (pemilik dihitung Premium). Free yang memilih bahasa diarahkan
+  sopan ke Premium TANPA masuk antrean.
+- Pemasangan: antrean KV tunggal `anon:queue` (entri {uid, at,
+  filter, avoid[]}). Ketukan Find mencoba memasangkan pendatang
+  dengan antrean tertua yang cocok dua arah (Anyone cocok dengan
+  semua; bahasa hanya dengan bahasa sama atau Anyone; daftar
+  hindar kedua pihak dihormati). Pasangan tertulis dua arah di
+  `anonpair:<uid>`; kedua pihak menerima "You're connected to a
+  stranger. Say hi!" + papan tombol sesi. Tidak ada yang cocok ->
+  mengantre dengan pesan "Looking for a partner…" + tombol
+  ❌ Cancel Search (callback `anon:cancel` benar-benar mengeluarkan
+  dari antrean). Pengingat sopan bila mengetik saat mengantre.
+- Sesi: hook khusus chat pribadi berjalan sesudah gerbang ban,
+  sebelum perutean normal. Selama berpasangan, semua pesan
+  diteruskan via copyMsg (teks, foto, video, stiker, suara, dokumen,
+  animasi, audio — semua jenis konten); tombol menu lain selama
+  sesi diteruskan sebagai pesan biasa. Hanya tiga kontrol yang
+  menginterupsi: ⏭️ Next, 🛑 Stop (atau /stop), 🚩 Report. Papan
+  tombol sesi (Next/Stop/Report) menggantikan menu utama selama
+  sesi dan menu utama dipulihkan ke kedua pihak saat sesi berakhir.
+- Next: sesi diakhiri (pihak lain menerima "Your partner left the
+  chat." + menu utama), penekan langsung mengantre lagi dengan
+  pasangan barusan di daftar hindar 1 putaran — terbukti tidak
+  dipasangkan ulang dari kedua arah; orang ketiga yang cocok yang
+  berpasangan berikutnya.
+- Stop: dua arah bersih, pihak lain menerima "Your partner ended
+  the chat." + menu utama, penekan menerima konfirmasi + menu utama.
+- Report: sesi tidak langsung berakhir — tampil konfirmasi
+  (🚩 Report & end chat / ↩️ Back; Back melanjutkan obrolan).
+  Konfirmasi mencatat laporan ringkas di KV `anonreport:<uid>:<ts>`
+  ({reporter, reported, at}), mengirim pemberitahuan ke ADMIN_ID
+  berisi ID numerik terlapor & reporter (untuk /admin_ban yang
+  sudah ada), mengakhiri sesi dua arah dengan pemberitahuan netral
+  ke terlapor ("The chat has ended." — tanpa identitas apa pun),
+  dan pelapor menerima "Thanks, our team will review. The chat has
+  ended."
+- Ketahanan: relay gagal (copyMsg melempar, mis. pasangan memblokir
+  bot) -> sesi ditutup + pengirim menerima penjelasan sopan + menu
+  utama. Kandidat antrean yang tidak terjangkau saat pemasangan
+  dilewati & dibuang dari antrean, pencarian berlanjut. Pengguna di
+  luar sesi/antrean tidak terpengaruh sama sekali.
+- Teks diselaraskan: TEKS_ANON_SOON ("coming in Phase 3") dihapus;
+  welcome (/start), Help (termasuk /anon di daftar perintah),
+  layar Premium, dan teks panel /admin_modules tidak lagi menyebut
+  Anon sebagai belum jadi.
+
+### Keputusan desain di titik yang konsepnya diam
+
+- Konsep §7 menulis Tahap 3 awal "teks saja, tanpa foto/berkas";
+  tugas pembangunan putaran ini memerintahkan relay SEMUA jenis
+  konten via copyMessage — perintah tugas yang diikuti. Uji relay
+  foto membuktikan jalur copyMsg yang sama dipakai media.
+- Bukti percakapan untuk peninjauan report (disebut konsep) tidak
+  disimpan: bot tidak pernah menyalin isi obrol yang direlay
+  (copyMessage tidak memberi bot isi teks), jadi yang dicatat
+  hanya pasangan ID + waktu laporan. Blokir bertingkat otomatis
+  untuk pelapor terbukti juga tidak dibangun — tindak lanjut ban
+  tetap keputusan pemilik lewat /admin_ban sesudah pemberitahuan.
+- Antrean kedaluwarsa 30 menit: entri lebih tua diabaikan saat
+  pembacaan (pencarian adalah niat "sekarang"), mencegah pasangan
+  hantu dari antrean berjam-jam.
+- Next mengantre ulang dengan filter Anyone; pilihan bahasa hanya
+  dibuat eksplisit di layar Find (tidak diingat dari sesi
+  sebelumnya).
+- Filter wilayah (disebut konsep sebagai "bahasa / wilayah kasar")
+  tidak dibangun: tugas hanya meminta dua filter bahasa, dan
+  wilayah tidak bisa diturunkan dari data yang bot miliki tanpa
+  menebak lokasi pengguna.
+- Saat mengantre, mengetuk tombol menu utama/perintah apa pun
+  mengeluarkan pengguna dari antrean diam-diam lalu mengalir ke
+  alur normal; masukan lain hanya memicu pengingat. Pesan relay
+  dari pengguna yang ter-ban di tengah sesi ditelan hook (gerbang
+  ban menjawab pesan teksnya lebih dulu di alur utama).
+
+### Penyesuaian uji lama (eksplisit)
+
+- Bagian 9: assertion "Anonymous Chat -> Phase 3 + catatan
+  keamanan" diganti — perilaku yang diuji memang dihapus. Judul
+  bagian diperbarui; assertion baru memeriksa intro modul
+  sungguhan (memuat "18+" + "identity is never shown" dan TIDAK
+  memuat "coming in Phase 3"). Jumlah assertion bagian 9 tetap.
+- Tidak ada assertion lama lain yang diubah; semua 271 uji lama
+  (termasuk penyesuaian di atas) lulus apa adanya.
+
+### Hasil uji putaran ini (dijalankan di mesin ini)
+
+- Baseline sebelum perubahan: Worker 271/271, eksekutor 38/38.
+- Akhir: `node tests/run_worker_test.mjs` -> **306 lulus, 0 gagal**
+  = 271 lama utuh + 35 baru di bagian 24: intro 18+ tercatat;
+  Free memilih filter bahasa -> Premium tanpa antre; dua pengguna
+  Find -> berpasangan dua arah + pesan sambung + papan sesi;
+  relay teks dua arah + relay foto via copyMsg, isi tidak pernah
+  dikirim bot sebagai teks; tombol menu lain diteruskan biasa;
+  Next (notifikasi + hindar dua arah + orang ketiga yang cocok);
+  Stop & /stop; Cancel Search; Report (konfirmasi, Back, record
+  KV, notifikasi admin ber-ID numerik, akhir netral, tombol basi);
+  filter Premium cocok dua arah + Anyone menjembatani + pemilik
+  bebas; ter-ban ditolak; modul mati jujur; relay ke pasangan yang
+  memblokir menutup sesi sopan; pengguna tanpa sesi tak terpengaruh.
+- `python3 tests/run_executor_test.py` -> **38 lulus, 0 gagal**
+  (tidak disentuh). `node --check worker/worker.js` OK. Grep nama
+  pribadi di worker/ + tests/ -> 0 temuan.
+
+### Belum terbukti untuk tambahan ini
+
+- Perilaku di layanan asli — belum di-push/di-deploy (menunggu
+  picu agen induk); bukti di atas murni uji lokal dengan io tiruan.
+- copyMessage adapter asli ke Bot API sungguhan belum teramati
+  live; pemasangan nyata butuh dua pengguna bersamaan mencari —
+  bukti akhir tetap uji pemilik dari HP dengan dua akun.

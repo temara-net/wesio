@@ -35,6 +35,9 @@ function buatIo(opts = {}) {
   const unbans = [];
   const memberChecks = [];
   const cbJawaban = [];
+  // Relay anonim (Tahap 3): copy panggilan tercatat; opts.failCopy
+  // membuat tiruan melempar seperti API saat pasangan memblokir bot.
+  const copies = [];
   let msgSeq = 5000;
   const gagalAksi = () => {
     if (opts.failActions) throw new Error("Forbidden: not enough rights");
@@ -53,6 +56,10 @@ function buatIo(opts = {}) {
     sendInvoice: async (chatId, inv) => { invoices.push({ chatId, inv }); },
     answerPreCheckout: async (id, ok, err) => { prechecks.push({ id, ok, err }); },
     answerCallback: async (id, text) => { cbJawaban.push({ id, text }); },
+    copyMsg: async (fromChatId, toChatId, messageId) => {
+      if (opts.failCopy) throw new Error("Forbidden: bot was blocked by the user");
+      copies.push({ fromChatId, toChatId, messageId });
+    },
     // ---- API grup tiruan ----
     // opts.memberStatus: peta "<gid>:<uid>" -> status Telegram, atau
     // fungsi (gid, uid) -> status. Bawaan "member".
@@ -119,7 +126,7 @@ function buatIo(opts = {}) {
   };
   return { io, kv, terkirim, invoices, prechecks, dispatches, aiCalls,
     keyTests, photos, photoBytes, restricts, deletions, bans, unbans,
-    memberChecks, cbJawaban };
+    memberChecks, cbJawaban, copies };
 }
 
 let seq = 0;
@@ -137,6 +144,14 @@ const paid = (uid, payload) => ({ update_id: ++seq, message: {
 
 const semua = (W) => W.terkirim.map(x => x.text).join("\n");
 const terakhir = (W) => W.terkirim[W.terkirim.length - 1];
+
+// ---- builder pesan pribadi berisi message_id + muatan apa pun ----
+// (relay anonim memakai message_id; msg() biasa tidak memuatnya)
+const pmsg = (uid, extra = {}) => ({ update_id: ++seq, message: {
+  message_id: 9000 + seq, chat: { id: uid, type: "private" },
+  from: { id: uid, first_name: "Tester" }, ...extra } });
+const keUser = (W, uid) => W.terkirim.filter(x => x.chatId === uid);
+const teksUser = (W, uid) => keUser(W, uid).map(x => x.text).join("\n");
 
 // ---- builder update grup (Tahap 2) ----
 const gchat = (gid, title = "Grup Uji") =>
@@ -317,7 +332,7 @@ console.log("8) Pembayaran dengan payload pengguna lain -> tidak mengaktifkan si
       terakhir(W).text.includes("doesn't match"), terakhir(W).text.slice(0, 150));
 }
 
-console.log("9) My Groups = panel sungguhan Tahap 2; Anonymous Chat tetap 'coming soon' jujur");
+console.log("9) My Groups = panel sungguhan Tahap 2; Anonymous Chat = modul sungguhan Tahap 3 (intro 18+)");
 {
   const W = buatIo({ ai: AI_ON });
   await handleUpdate(W.io, msg(9001, "🛡️ My Groups"));
@@ -328,9 +343,12 @@ console.log("9) My Groups = panel sungguhan Tahap 2; Anonymous Chat tetap 'comin
       !terakhir(W).text.includes("coming in Phase 2"),
       terakhir(W).text.slice(0, 150));
   await handleUpdate(W.io, msg(9001, "💬 Anonymous Chat"));
-  cek("Anonymous Chat -> Phase 3 + catatan keamanan",
-      terakhir(W).text.includes("coming in Phase 3") &&
-      terakhir(W).text.includes("18+"), terakhir(W).text.slice(0, 150));
+  cek("Anonymous Chat -> modul sungguhan: intro keamanan + 18+ (bukan 'coming in Phase 3')",
+      terakhir(W).text.includes("Anonymous Chat") &&
+      terakhir(W).text.includes("18+") &&
+      terakhir(W).text.includes("identity is never shown") &&
+      !terakhir(W).text.includes("coming in Phase 3"),
+      terakhir(W).text.slice(0, 150));
 }
 
 console.log("10) /admin_stats: non-admin ditolak, admin dapat laporan");
@@ -1807,6 +1825,264 @@ console.log("23) Moderasi Grup Tahap 2: siklus grup, panel, captcha, tangga peri
         !W.kv.has("group:-100222") &&
         keGrup(W, -100222).length === 0, "");
   }
+}
+
+console.log("24) Anonymous Chat Tahap 3: intro 18+, antrean, pasangan, relay copyMsg, Next/Stop/Report, filter Premium");
+{
+  // ---- (a) Masuk: intro 18+ -> konfirmasi tercatat -> layar Find;
+  // filter bahasa untuk Free ditolak sopan TANPA masuk antrean ----
+  const W = buatIo({ ai: AI_ON });
+  await handleUpdate(W.io, msg(2401, "💬 Anonymous Chat"));
+  cek("masuk pertama kali -> intro keamanan + 18+ + tombol konfirmasi",
+      terakhir(W).text.includes("18+") &&
+      terakhir(W).text.includes("identity is never shown") &&
+      (terakhir(W).markup?.inline_keyboard || []).flat()
+        .some(b => b.callback_data === "anon:ok18"),
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, cb(2401, "anon:ok18"));
+  cek("konfirmasi 18+ tercatat di KV (anonprof)",
+      !!W.kv.get("anonprof:2401"), [...W.kv.keys()].join(","));
+  cek("sesudah konfirmasi -> layar Find Partner tampil",
+      teksUser(W, 2401).includes("Find Partner"), teksUser(W, 2401).slice(-200));
+  await handleUpdate(W.io, cb(2401, "anon:find:en"));
+  cek("pengguna Free memilih filter bahasa -> diarahkan Premium",
+      terakhir(W).text.includes("Premium feature"), terakhir(W).text.slice(0, 150));
+  cek("Free yang ditolak TIDAK masuk antrean & tidak berpasangan",
+      (JSON.parse(W.kv.get("anon:queue") || "[]")).length === 0 &&
+      !W.kv.has("anonpair:2401"), W.kv.get("anon:queue") || "kosong");
+
+  // ---- (b) Antrean + pemasangan dua arah saat orang kedua datang ----
+  await handleUpdate(W.io, cb(2401, "anon:find:any"));
+  cek("Find Partner sendirian -> pesan mencari + masuk antrean",
+      terakhir(W).text.includes("Looking for a partner") &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]"))
+        .some(e => e.uid === 2401 && e.filter === "any"),
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(2401, "halo, ada orang?"));
+  cek("mengetik saat mengantre -> pengingat mencari, tetap di antrean",
+      terakhir(W).text.includes("still looking for a partner") &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]")).length === 1,
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(2402, "💬 Anonymous Chat"));
+  await handleUpdate(W.io, cb(2402, "anon:ok18"));
+  await handleUpdate(W.io, cb(2402, "anon:find:any"));
+  cek("orang kedua datang -> pasangan tertulis dua arah + antrean kosong",
+      W.kv.get("anonpair:2401") === "2402" &&
+      W.kv.get("anonpair:2402") === "2401" &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]")).length === 0,
+      [...W.kv.keys()].join(","));
+  cek("kedua pihak menerima pesan sambung persis konsep",
+      keUser(W, 2401).some(x => x.text.includes("You're connected to a stranger. Say hi!")) &&
+      keUser(W, 2402).some(x => x.text.includes("You're connected to a stranger. Say hi!")), "");
+  const msgNyambung = keUser(W, 2401)
+    .find(x => x.text.includes("You're connected"));
+  cek("pesan sambung membawa papan tombol sesi (Next/Stop/Report)",
+      (msgNyambung.markup?.keyboard || []).flat()
+        .join(" ").includes("⏭️ Next") &&
+      (msgNyambung.markup?.keyboard || []).flat()
+        .join(" ").includes("🛑 Stop") &&
+      (msgNyambung.markup?.keyboard || []).flat()
+        .join(" ").includes("🚩 Report"),
+      JSON.stringify(msgNyambung.markup));
+
+  // ---- (c) Relay dua arah via copyMsg, tanpa identitas apa pun ----
+  const idA = 9101, idB = 9102;
+  await handleUpdate(W.io, pmsg(2401, { message_id: idA, text: "halo stranger" }));
+  await handleUpdate(W.io, pmsg(2402, { message_id: idB,
+    photo: [{ file_id: "foto-tiruan" }] }));
+  cek("relay teks A->B dan foto B->A sama-sama lewat copyMsg",
+      W.copies.length === 2 &&
+      W.copies[0].fromChatId === 2401 && W.copies[0].toChatId === 2402 &&
+      W.copies[0].messageId === idA &&
+      W.copies[1].fromChatId === 2402 && W.copies[1].toChatId === 2401 &&
+      W.copies[1].messageId === idB, JSON.stringify(W.copies));
+  cek("isi relay TIDAK pernah dikirim bot sebagai teks (tanpa atribusi)",
+      !teksUser(W, 2402).includes("halo stranger") &&
+      !semua(W).includes("Tester"), "");
+  const kirimSebelum = W.terkirim.length;
+  await handleUpdate(W.io, pmsg(2401, { message_id: 9103, text: "⭐ Premium" }));
+  cek("tombol menu lain selama sesi diteruskan sebagai teks biasa",
+      W.copies.length === 3 && W.terkirim.length === kirimSebelum,
+      String(W.terkirim.length - kirimSebelum));
+}
+{
+  // ---- (d) Next: pihak lama diberi tahu + menu kembali; penekan
+  // mengantre ulang dengan daftar hindar; tidak dipasangkan lagi ----
+  const W = buatIo({ ai: AI_ON });
+  for (const u of [2411, 2412]) {
+    await handleUpdate(W.io, msg(u, "💬 Anonymous Chat"));
+    await handleUpdate(W.io, cb(u, "anon:ok18"));
+    await handleUpdate(W.io, cb(u, "anon:find:any"));
+  }
+  await handleUpdate(W.io, msg(2411, "⏭️ Next"));
+  const utkB = keUser(W, 2412);
+  cek("Next -> pihak lama menerima 'Your partner left the chat.' + menu utama",
+      utkB[utkB.length - 1].text.includes("Your partner left the chat.") &&
+      (utkB[utkB.length - 1].markup?.keyboard || []).flat()
+        .includes("🤖 AI Chat"), utkB[utkB.length - 1].text);
+  const antre = JSON.parse(W.kv.get("anon:queue") || "[]");
+  cek("Next -> pasangan terhapus dua arah; penekan mengantre ulang dgn hindar",
+      !W.kv.has("anonpair:2411") && !W.kv.has("anonpair:2412") &&
+      antre.length === 1 && antre[0].uid === 2411 &&
+      (antre[0].avoid || []).includes(2412), JSON.stringify(antre));
+  await handleUpdate(W.io, cb(2412, "anon:find:any"));
+  cek("mantan pasangan mencari lagi -> TIDAK dipasangkan ulang satu sama lain",
+      !W.kv.has("anonpair:2411") && !W.kv.has("anonpair:2412") &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]")).length === 2, "");
+  await handleUpdate(W.io, msg(2413, "💬 Anonymous Chat"));
+  await handleUpdate(W.io, cb(2413, "anon:ok18"));
+  await handleUpdate(W.io, cb(2413, "anon:find:any"));
+  cek("orang ketiga cocok dengan antrean tertua yang cocok (bukan yg menghindar)",
+      W.kv.get("anonpair:2411") === "2413" &&
+      W.kv.get("anonpair:2413") === "2411" &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]"))
+        .some(e => e.uid === 2412), [...W.kv.keys()].join(","));
+}
+{
+  // ---- (e) Stop lewat tombol dan lewat /stop: dua arah bersih ----
+  const W = buatIo({ ai: AI_ON });
+  for (const u of [2421, 2422]) {
+    await handleUpdate(W.io, msg(u, "💬 Anonymous Chat"));
+    await handleUpdate(W.io, cb(u, "anon:ok18"));
+    await handleUpdate(W.io, cb(u, "anon:find:any"));
+  }
+  await handleUpdate(W.io, msg(2421, "🛑 Stop"));
+  cek("Stop -> pihak lain diberi tahu + menu utama; penekan terkonfirmasi",
+      teksUser(W, 2422).includes("Your partner ended the chat.") &&
+      teksUser(W, 2421).includes("You left the chat.") &&
+      !W.kv.has("anonpair:2421") && !W.kv.has("anonpair:2422"), "");
+  for (const u of [2421, 2422]) {
+    await handleUpdate(W.io, cb(u, "anon:find:any"));
+  }
+  await handleUpdate(W.io, msg(2422, "/stop"));
+  cek("/stop bekerja sama seperti tombol Stop",
+      teksUser(W, 2421).includes("Your partner ended the chat.") &&
+      !W.kv.has("anonpair:2421") && !W.kv.has("anonpair:2422"), "");
+}
+{
+  // ---- (f) Cancel Search: benar-benar keluar dari antrean ----
+  const W = buatIo({ ai: AI_ON });
+  await handleUpdate(W.io, msg(2431, "💬 Anonymous Chat"));
+  await handleUpdate(W.io, cb(2431, "anon:ok18"));
+  await handleUpdate(W.io, cb(2431, "anon:find:any"));
+  await handleUpdate(W.io, cb(2431, "anon:cancel"));
+  cek("Cancel Search -> keluar antrean + konfirmasi",
+      (JSON.parse(W.kv.get("anon:queue") || "[]")).length === 0 &&
+      teksUser(W, 2431).includes("Search cancelled"), "");
+  await handleUpdate(W.io, msg(2432, "💬 Anonymous Chat"));
+  await handleUpdate(W.io, cb(2432, "anon:ok18"));
+  await handleUpdate(W.io, cb(2432, "anon:find:any"));
+  cek("orang berikutnya mengantre sendirian (yang batal tidak dipasangkan)",
+      !W.kv.has("anonpair:2432") &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]")).length === 1, "");
+}
+{
+  // ---- (g) Report: konfirmasi dulu; Back melanjutkan; Report & end
+  // mencatat + memberi tahu admin (ID numerik) + sesi berakhir netral ----
+  const W = buatIo({ ai: AI_ON, adminId: 111 });
+  for (const u of [2441, 2442]) {
+    await handleUpdate(W.io, msg(u, "💬 Anonymous Chat"));
+    await handleUpdate(W.io, cb(u, "anon:ok18"));
+    await handleUpdate(W.io, cb(u, "anon:find:any"));
+  }
+  await handleUpdate(W.io, msg(2441, "🚩 Report"));
+  cek("Report -> konfirmasi tampil, sesi TIDAK langsung berakhir",
+      teksUser(W, 2441).includes("Report your partner?") &&
+      W.kv.get("anonpair:2441") === "2442", "");
+  await handleUpdate(W.io, cb(2441, "anon:repback"));
+  cek("Back -> sesi berlanjut seperti semula",
+      W.kv.get("anonpair:2441") === "2442" &&
+      teksUser(W, 2441).includes("chat continues"), "");
+  await handleUpdate(W.io, msg(2441, "🚩 Report"));
+  await handleUpdate(W.io, cb(2441, "anon:repok"));
+  const kunciLaporan = [...W.kv.keys()].filter(k => k.startsWith("anonreport:"));
+  const isiLaporan = kunciLaporan.length
+    ? JSON.parse(W.kv.get(kunciLaporan[0])) : {};
+  cek("Report & end -> laporan tercatat ringkas di KV",
+      kunciLaporan.length === 1 && isiLaporan.reporter === 2441 &&
+      isiLaporan.reported === 2442, JSON.stringify(isiLaporan));
+  cek("admin menerima pemberitahuan berisi ID numerik terlapor & pelapor",
+      keUser(W, 111).some(x => x.text.includes("Reported user ID: 2442") &&
+        x.text.includes("Reporter ID: 2441")),
+      teksUser(W, 111).slice(-300));
+  cek("sesi berakhir dua arah; pihak lain menerima pemberitahuan netral",
+      !W.kv.has("anonpair:2441") && !W.kv.has("anonpair:2442") &&
+      teksUser(W, 2442).includes("The chat has ended.") &&
+      !teksUser(W, 2442).includes("2441"), "");
+  cek("pelapor terkonfirmasi tanpa identitas apa pun tentang terlapor",
+      teksUser(W, 2441)
+        .includes("Thanks, our team will review. The chat has ended."), "");
+  await handleUpdate(W.io, cb(2441, "anon:repok"));
+  cek("tombol laporan basi -> 'sudah berakhir' + tidak ada laporan ganda",
+      terakhir(W).text.includes("already ended") &&
+      [...W.kv.keys()].filter(k => k.startsWith("anonreport:")).length === 1, "");
+}
+{
+  // ---- (h) Filter Premium: cocok dua arah; Anyone menjembatani;
+  // pemilik bebas filter tanpa record Premium ----
+  const W = buatIo({ ai: AI_ON, adminId: 111 });
+  const prem = new Date(Date.now() + 86400000).toISOString();
+  W.kv.set("premium:2451", prem);
+  W.kv.set("premium:2452", prem);
+  for (const [u, f] of [[2451, "anon:find:en"], [2452, "anon:find:id"]]) {
+    await handleUpdate(W.io, msg(u, "💬 Anonymous Chat"));
+    await handleUpdate(W.io, cb(u, "anon:ok18"));
+    await handleUpdate(W.io, cb(u, f));
+  }
+  cek("Premium en vs Premium id -> tidak cocok, keduanya tetap mengantre",
+      !W.kv.has("anonpair:2451") && !W.kv.has("anonpair:2452") &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]")).length === 2, "");
+  W.kv.set("premium:2453", prem);
+  await handleUpdate(W.io, msg(2453, "💬 Anonymous Chat"));
+  await handleUpdate(W.io, cb(2453, "anon:ok18"));
+  await handleUpdate(W.io, cb(2453, "anon:find:any"));
+  cek("Premium Anyone -> berpasangan dengan antrean cocok tertua (en)",
+      W.kv.get("anonpair:2451") === "2453" &&
+      W.kv.get("anonpair:2453") === "2451" &&
+      (JSON.parse(W.kv.get("anon:queue") || "[]"))
+        .some(e => e.uid === 2452), [...W.kv.keys()].join(","));
+  await handleUpdate(W.io, msg(111, "💬 Anonymous Chat"));
+  await handleUpdate(W.io, cb(111, "anon:ok18"));
+  await handleUpdate(W.io, cb(111, "anon:find:en"));
+  cek("pemilik memakai filter bahasa tanpa diarahkan Premium",
+      !teksUser(W, 111).includes("Premium feature") &&
+      !W.kv.has("anonpair:111"), teksUser(W, 111).slice(-200));
+}
+{
+  // ---- (i) Ter-ban ditolak; modul mati menjawab jujur ----
+  const W = buatIo({ ai: AI_ON });
+  W.kv.set("ban:2461", "1");
+  await handleUpdate(W.io, msg(2461, "💬 Anonymous Chat"));
+  cek("pengguna ter-ban ditolak sopan di pintu modul",
+      terakhir(W).text.includes("suspended by the admin") &&
+      !W.kv.has("anonprof:2461"), terakhir(W).text.slice(0, 120));
+  const W2 = buatIo({ ai: AI_ON });
+  W2.kv.set("config:modules", JSON.stringify(
+    { ai: true, download: true, groups: true, anon: false }));
+  await handleUpdate(W2.io, msg(2462, "💬 Anonymous Chat"));
+  cek("modul anon mati -> pesan 'temporarily off'",
+      terakhir(W2).text.includes("temporarily off"),
+      terakhir(W2).text.slice(0, 120));
+}
+{
+  // ---- (j) Pasangan memblokir bot -> relay gagal menutup sesi sopan;
+  // pengguna di luar sesi tidak terpengaruh sama sekali ----
+  const opsi = { ai: AI_ON };
+  const W = buatIo(opsi);
+  for (const u of [2471, 2472]) {
+    await handleUpdate(W.io, msg(u, "💬 Anonymous Chat"));
+    await handleUpdate(W.io, cb(u, "anon:ok18"));
+    await handleUpdate(W.io, cb(u, "anon:find:any"));
+  }
+  opsi.failCopy = true;
+  await handleUpdate(W.io, pmsg(2471, { message_id: 9701, text: "masih di sana?" }));
+  cek("copyMsg melempar (pasangan memblokir) -> sesi ditutup + penjelasan",
+      !W.kv.has("anonpair:2471") && !W.kv.has("anonpair:2472") &&
+      teksUser(W, 2471).includes("unreachable"),
+      teksUser(W, 2471).slice(-200));
+  await handleUpdate(W.io, msg(2481, "🤖 AI Chat"));
+  cek("pengguna tanpa sesi memakai modul lain seperti biasa",
+      terakhir(W).text.includes("15 of 15"), terakhir(W).text.slice(-150));
 }
 
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);

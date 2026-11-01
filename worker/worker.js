@@ -70,6 +70,36 @@ const GO_PREMIUM_MARKUP = {
   inline_keyboard: [[{ text: "⭐ Go Premium", callback_data: "nav:premium" }]],
 };
 
+// ---------------- Anonymous Chat (Phase 3) ----------------
+// While a user is paired, the main menu is replaced by a small
+// session keyboard whose buttons are always visible (concept §2/§7).
+const ANON_MARKUP = {
+  keyboard: [["⏭️ Next", "🛑 Stop"], ["🚩 Report"]],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+const ANON_FIND_MARKUP = {
+  inline_keyboard: [
+    [{ text: "🔍 Find Partner", callback_data: "anon:find:any" }],
+    [{ text: "🌐 Same language — English ⭐", callback_data: "anon:find:en" },
+     { text: "🌐 Same language — Indonesian ⭐", callback_data: "anon:find:id" }],
+  ],
+};
+const ANON_OK18_MARKUP = {
+  inline_keyboard: [[
+    { text: "✅ I am 18 or older — continue", callback_data: "anon:ok18" }]],
+};
+const ANON_CANCEL_MARKUP = {
+  inline_keyboard: [[
+    { text: "❌ Cancel Search", callback_data: "anon:cancel" }]],
+};
+const ANON_REPORT_MARKUP = {
+  inline_keyboard: [
+    [{ text: "🚩 Report & end chat", callback_data: "anon:repok" }],
+    [{ text: "↩️ Back", callback_data: "anon:repback" }],
+  ],
+};
+
 const AI_KEYBOARD = {
   inline_keyboard: [
     [{ text: "⚡ Fast model", callback_data: "ai:model:fast" },
@@ -208,7 +238,7 @@ function teksWelcome(nama) {
     "🤖 AI Chat — ask questions, write, translate, summarize\n" +
     "⬇️ Downloader — save videos & audio from almost any site\n" +
     "🛡️ Group Moderation — add me as a group admin and I'll guard it\n" +
-    "💬 Anonymous Chat — coming in Phase 3\n" +
+    "💬 Anonymous Chat — meet a stranger, no names shared\n" +
     "⭐ Premium — bigger quotas and the strongest AI model\n\n" +
     "Just tap a button below to begin. Free to use — Premium is optional.";
 }
@@ -227,19 +257,32 @@ const TEKS_HELP =
   "clean: link control for new members, a tap-to-join check, banned " +
   "words, a welcome message and step-by-step warnings. Tap " +
   "🛡️ My Groups to set it all up with buttons.\n\n" +
+  "💬 Anonymous Chat — tap it, confirm you are 18+, then tap " +
+  "🔍 Find Partner and I will pair you with a stranger. Nothing about " +
+  "you is ever shown — no name, no username, no photo. While you " +
+  "chat, ⏭️ Next, 🛑 Stop and 🚩 Report are always on screen.\n\n" +
   "⭐ Premium — one subscription raises every quota and unlocks the strong " +
   "AI model. Tap ⭐ Premium to compare Free vs Premium.\n\n" +
   "Quotas reset every day at 00:00 UTC. Commands if you like typing: " +
-  "/start /ai /download /premium /help";
+  "/start /ai /download /anon /premium /help";
 
-const TEKS_ANON_SOON =
-  "💬 Anonymous Chat — coming in Phase 3\n\n" +
-  "Soon you will be able to chat with a stranger without sharing your " +
-  "name, username or photo. You will always see Next, Stop and Report " +
-  "buttons, and it will be text-only and 18+ at launch, for safety.\n\n" +
-  "It is not live yet — matching needs many users online at the same " +
-  "time, so it launches after the other modules. 🤖 AI Chat and the " +
-  "⬇️ Downloader already work — tap a button below.";
+const TEKS_ANON_INTRO =
+  "💬 Anonymous Chat\n\n" +
+  "You are about to chat with a complete stranger. For your safety:\n\n" +
+  "🔞 This module is 18+ only.\n" +
+  "🙈 Your identity is never shown — no name, no username, no photo. " +
+  "The stranger only sees the messages you send.\n" +
+  "⚠️ Never share personal information: not your real name, address, " +
+  "phone number, photos of yourself, or other accounts.\n" +
+  "🚩 If someone misbehaves, tap 🚩 Report — the chat ends and our " +
+  "team is notified.\n\n" +
+  "Tap below to confirm you are 18 or older and continue.";
+
+const TEKS_ANON_FIND =
+  "💬 Anonymous Chat\n\n" +
+  "Tap 🔍 Find Partner and I will look for a stranger for you. " +
+  "Matching by language is a ⭐ Premium option — everyone can always " +
+  "match with 🌍 anyone.";
 
 const TEKS_AI_OFF =
   "🤖 AI Chat is not switched on yet on my side — the AI service has not " +
@@ -1136,8 +1179,7 @@ async function tampilPremium(io, chatId, uid) {
     "strongest model, 20 images/day\n" +
     `⬇️ Downloads: ${LIMITS.dlFree}/day → ${LIMITS.dlPremium}/day, ` +
     "priority queue\n" +
-    "💬 Anonymous Chat (Phase 3): standard matching → language/region " +
-    "filters\n\n" +
+    "💬 Anonymous Chat: standard matching → language filters\n\n" +
     `Price: ${LIMITS.premiumStars} Stars for ${LIMITS.premiumDays} days, ` +
     "paid inside Telegram — no card, no leaving the app.",
     markup);
@@ -2190,9 +2232,9 @@ async function tampilAdminModules(io, chatId, uid) {
   await io.send(chatId,
     "🛠️ Module switches\n\n" +
     "Tap a module to switch it on or off. While a module is off, users " +
-    "get a friendly note and no quota is used. Anonymous Chat still " +
-    "answers 'coming soon' while it is on — its phase is not built " +
-    "yet. Group Moderation is live in groups where I am an admin.",
+    "get a friendly note and no quota is used. Group Moderation is " +
+    "live in groups where I am an admin, and Anonymous Chat is live " +
+    "for users who tap 💬 Anonymous Chat.",
     { inline_keyboard: rows });
 }
 
@@ -2234,6 +2276,294 @@ async function adminUnban(io, chatId, uid, target) {
     `✅ User ${target} is no longer banned.`, MENU_MARKUP);
 }
 
+// ---------------- Module: Anonymous Chat ----------------
+// KV layout:
+//   anonprof:<uid>          -> JSON {ok18: ISO} (the recorded 18+
+//                              confirmation, asked once)
+//   anon:queue              -> JSON array of waiting entries
+//                              {uid, at, filter, avoid[]} — "filter" is
+//                              "any" | "en" | "id"; "avoid" holds the
+//                              most recent partner (set by Next) so the
+//                              same two people are not re-paired on
+//                              that search round.
+//   anonpair:<uid>          -> partner uid (written in both directions)
+//   anonreport:<uid>:<ts>   -> JSON {reporter, reported, at}
+// Matching runs when someone taps Find Partner: the newcomer is tried
+// against the waiting queue (oldest first); if nobody fits, they join
+// the queue. A queued entry older than 30 minutes is ignored — a
+// search is a "right now" intention, not a subscription.
+// Relay uses Telegram copyMessage: the partner's client renders the
+// content as if the bot sent it — no forward header, no name, no
+// username, nothing about the sender is ever attached.
+const ANON_QUEUE_MAX_MS = 30 * 60 * 1000;
+const TEKS_ANON_NYAMBUNG =
+  "🎉 You're connected to a stranger. Say hi!\n\n" +
+  "Nothing about you is shown — and nothing about them either. " +
+  "Stay kind, and never share personal information.";
+
+async function muatAntrean(io) {
+  try {
+    const v = await io.kvGet("anon:queue");
+    const q = v ? JSON.parse(v) : [];
+    if (!Array.isArray(q)) return [];
+    const kini = Date.now();
+    return q.filter(e => e && e.uid != null &&
+      (kini - (e.at || 0)) < ANON_QUEUE_MAX_MS);
+  } catch (e) { return []; }
+}
+
+async function simpanAntrean(io, q) {
+  await io.kvPut("anon:queue", JSON.stringify(q));
+}
+
+function filterCocok(a, b) {
+  return a === "any" || b === "any" || a === b;
+}
+
+async function pasanganDari(io, uid) {
+  const v = await io.kvGet("anonpair:" + uid);
+  if (!v) return null;
+  const n = Number(v);
+  return Number.isNaN(n) ? null : n;
+}
+
+// Removes the pair in both directions; returns the partner's uid.
+async function akhiriPasangan(io, uid) {
+  const p = await pasanganDari(io, uid);
+  if (p == null) return null;
+  await io.kvDel("anonpair:" + uid);
+  await io.kvDel("anonpair:" + p);
+  return p;
+}
+
+// Tries to pair the newcomer with someone waiting. Returns the
+// partner's uid, or null when nobody fits right now.
+async function cobaPasangkan(io, entri) {
+  const q = await muatAntrean(io);
+  let berubah = false;
+  for (let i = 0; i < q.length; i++) {
+    const c = q[i];
+    if (c.uid === entri.uid) continue;
+    if ((entri.avoid || []).includes(c.uid)) continue;
+    if ((c.avoid || []).includes(entri.uid)) continue;
+    if (!filterCocok(entri.filter || "any", c.filter || "any")) continue;
+    q.splice(i, 1);
+    berubah = true;
+    await io.kvPut("anonpair:" + entri.uid, String(c.uid));
+    await io.kvPut("anonpair:" + c.uid, String(entri.uid));
+    try {
+      await io.send(c.uid, TEKS_ANON_NYAMBUNG, ANON_MARKUP);
+    } catch (e) {
+      // The waiting user cannot be reached (e.g. they blocked the
+      // bot): undo the pairing, drop them, and keep looking.
+      await io.kvDel("anonpair:" + entri.uid);
+      await io.kvDel("anonpair:" + c.uid);
+      i--; // the next candidate shifted into this slot
+      continue;
+    }
+    await io.send(entri.uid, TEKS_ANON_NYAMBUNG, ANON_MARKUP);
+    await simpanAntrean(io, q);
+    return c.uid;
+  }
+  if (berubah) await simpanAntrean(io, q);
+  return null;
+}
+
+// Puts the user into the matching flow: pairs them at once when
+// somebody fits, otherwise parks them in the queue with a Cancel
+// button. Returns true when paired immediately.
+async function masukAntrean(io, uid, filter, avoid) {
+  const entri = { uid, at: Date.now(), filter: filter || "any",
+    avoid: avoid || [] };
+  if ((await cobaPasangkan(io, entri)) != null) return true;
+  const q = await muatAntrean(io);
+  if (!q.some(e => e.uid === uid)) {
+    q.push(entri);
+    await simpanAntrean(io, q);
+  }
+  await io.send(uid,
+    filter && filter !== "any"
+      ? "🔍 Looking for a partner who matches your language choice… " +
+        "I'll connect you the moment someone fits."
+      : "🔍 Looking for a partner… I'll connect you the moment " +
+        "someone else arrives.",
+    ANON_CANCEL_MARKUP);
+  return false;
+}
+
+async function masukAnon(io, chatId, uid) {
+  if ((await pasanganDari(io, uid)) != null) {
+    await io.send(chatId,
+      "💬 You're already in an anonymous chat — your messages go to " +
+      "your partner. Use ⏭️ Next, 🛑 Stop or 🚩 Report below.",
+      ANON_MARKUP);
+    return;
+  }
+  const q = await muatAntrean(io);
+  if (q.some(e => e.uid === uid)) {
+    await io.send(chatId,
+      "🔍 You're still in the partner queue — I'll connect you as " +
+      "soon as someone matches.", ANON_CANCEL_MARKUP);
+    return;
+  }
+  if (!(await io.kvGet("anonprof:" + uid))) {
+    await io.send(chatId, TEKS_ANON_INTRO, ANON_OK18_MARKUP);
+    return;
+  }
+  await io.send(chatId, TEKS_ANON_FIND, ANON_FIND_MARKUP);
+}
+
+// Find Partner taps (filter "any" | "en" | "id"). Language filters
+// are Premium (the owner counts as Premium, as everywhere else).
+async function anonCari(io, chatId, uid, filter) {
+  if (!(await modulAktif(io, "anon"))) {
+    await pesanModulOff(io, chatId, "anon");
+    return;
+  }
+  if (!(await io.kvGet("anonprof:" + uid))) {
+    await io.send(chatId, TEKS_ANON_INTRO, ANON_OK18_MARKUP);
+    return;
+  }
+  if ((await pasanganDari(io, uid)) != null) {
+    await io.send(chatId,
+      "💬 You're already in an anonymous chat — finish it with " +
+      "🛑 Stop or ⏭️ Next first.", ANON_MARKUP);
+    return;
+  }
+  if (filter !== "any" && filter !== "en" && filter !== "id") {
+    filter = "any";
+  }
+  if (filter !== "any" && !(await premiumAktif(io, uid))) {
+    await io.send(chatId,
+      "🌐 Matching by language is a ⭐ Premium feature. Free matching " +
+      "with 🌍 anyone is always open — or tap below to unlock " +
+      "language filters.", GO_PREMIUM_MARKUP);
+    return;
+  }
+  const q = await muatAntrean(io);
+  if (q.some(e => e.uid === uid)) {
+    await io.send(chatId,
+      "🔍 You're already in the queue — I'll connect you as soon as " +
+      "someone matches.", ANON_CANCEL_MARKUP);
+    return;
+  }
+  await masukAntrean(io, uid, filter, []);
+}
+
+async function anonNext(io, chatId, uid) {
+  const lama = await akhiriPasangan(io, uid);
+  if (lama == null) {
+    await io.send(chatId, "You're not in a chat right now.", MENU_MARKUP);
+    return;
+  }
+  try {
+    await io.send(lama, "Your partner left the chat.", MENU_MARKUP);
+  } catch (e) { /* unreachable partner: nothing to notify */ }
+  // Straight back into the queue, skipping the partner just left for
+  // this search round. The re-search uses the Anyone filter — a
+  // language choice is made explicitly on the Find screen.
+  await masukAntrean(io, uid, "any", [lama]);
+}
+
+async function anonStop(io, chatId, uid) {
+  const lama = await akhiriPasangan(io, uid);
+  if (lama == null) {
+    await io.send(chatId, "You're not in a chat right now.", MENU_MARKUP);
+    return;
+  }
+  try {
+    await io.send(lama, "Your partner ended the chat.", MENU_MARKUP);
+  } catch (e) { /* unreachable partner: nothing to notify */ }
+  await io.send(chatId,
+    "🛑 You left the chat. Tap a button below whenever you're ready.",
+    MENU_MARKUP);
+}
+
+async function anonLaporTanya(io, chatId, uid) {
+  await io.send(chatId,
+    "🚩 Report your partner?\n\n" +
+    "If they broke the rules — spam, harassment, anything illegal — " +
+    "report them: the chat ends right away and our team is notified " +
+    "so they can review. Nothing about you is shared.",
+    ANON_REPORT_MARKUP);
+}
+
+async function anonLaporKirim(io, chatId, uid) {
+  const terlapor = await akhiriPasangan(io, uid);
+  if (terlapor == null) {
+    await io.send(chatId, "That chat has already ended.", MENU_MARKUP);
+    return;
+  }
+  const kini = new Date().toISOString();
+  await io.kvPut(`anonreport:${uid}:${Date.now()}`, JSON.stringify(
+    { reporter: uid, reported: terlapor, at: kini }));
+  // The owner alone receives the numeric IDs — that is what the
+  // existing /admin_ban works on. Users never see any identity.
+  if (io.adminId != null && String(io.adminId) !== "") {
+    try {
+      await io.send(io.adminId,
+        "🚩 Anonymous Chat report\n\n" +
+        `Reported user ID: ${terlapor}\n` +
+        `Reporter ID: ${uid}\n` +
+        `Time: ${kini}\n\n` +
+        `If the report checks out: /admin_ban ${terlapor}`);
+    } catch (e) { /* an unreachable owner must not block the reporter */ }
+  }
+  try {
+    await io.send(terlapor, "The chat has ended.", MENU_MARKUP);
+  } catch (e) { /* unreachable partner: nothing to notify */ }
+  await io.send(chatId,
+    "Thanks, our team will review. The chat has ended.", MENU_MARKUP);
+}
+
+// Session hook for private chats; runs before the normal routing.
+// Returns true when the update belongs to a session or the queue.
+async function sesiAnonHook(io, msg, chatId, uid) {
+  const teks = (msg.text || "").trim();
+  const pasangan = await pasanganDari(io, uid);
+  if (pasangan != null) {
+    // The generic ban gate already answered text messages from a
+    // banned user above; media from one must not relay either.
+    if (!adalahAdmin(io, uid) && (await terban(io, uid))) return true;
+    if (teks === "⏭️ Next") { await anonNext(io, chatId, uid); return true; }
+    if (teks === "🛑 Stop" ||
+        teks.toLowerCase().split("@")[0] === "/stop") {
+      await anonStop(io, chatId, uid);
+      return true;
+    }
+    if (teks === "🚩 Report") {
+      await anonLaporTanya(io, chatId, uid);
+      return true;
+    }
+    if (msg.message_id == null) return true;
+    try {
+      await io.copyMsg(chatId, pasangan, msg.message_id);
+    } catch (e) {
+      // The partner blocked the bot (or is otherwise unreachable):
+      // close the session cleanly instead of relaying into the void.
+      await akhiriPasangan(io, uid);
+      await io.send(chatId,
+        "😕 Your partner is unreachable, so this chat has ended.",
+        MENU_MARKUP);
+    }
+    return true;
+  }
+  const q = await muatAntrean(io);
+  const idx = q.findIndex(e => e.uid === uid);
+  if (idx < 0) return false;
+  // Menu taps and commands leave the queue quietly and continue into
+  // the normal flow; anything else just gets a reminder.
+  if (MENU_BUTTONS.includes(teks) || teks.startsWith("/")) {
+    q.splice(idx, 1);
+    await simpanAntrean(io, q);
+    return false;
+  }
+  await io.send(chatId,
+    "🔍 You're still looking for a partner — I'll connect you as " +
+    "soon as someone matches.", ANON_CANCEL_MARKUP);
+  return true;
+}
+
 // ---------------- Callback queries (inline buttons) ----------------
 async function handleCallback(io, cq) {
   const uid = cq.from && cq.from.id;
@@ -2265,6 +2595,44 @@ async function handleCallback(io, cq) {
   if (data === "grp:noop") return; // label button in the group panel
   if (data.startsWith("grp:")) {
     await ruteGrupCallback(io, chatId, uid, data);
+    return;
+  }
+
+  if (data === "anon:ok18") {
+    if (!(await modulAktif(io, "anon"))) {
+      await pesanModulOff(io, chatId, "anon");
+      return;
+    }
+    // The 18+ confirmation is recorded once (concept §7: the age
+    // statement is a hard requirement of this module).
+    await io.kvPut("anonprof:" + uid,
+      JSON.stringify({ ok18: new Date().toISOString() }));
+    await io.send(chatId,
+      "✅ Confirmed — you're 18 or older. I won't ask again.\n\n" +
+      "Tap 🔍 Find Partner and I will look for a stranger for you. " +
+      "Matching by language is a ⭐ Premium option — everyone can " +
+      "always match with 🌍 anyone.", ANON_FIND_MARKUP);
+    return;
+  }
+  if (data.startsWith("anon:find:")) {
+    await anonCari(io, chatId, uid, data.slice("anon:find:".length));
+    return;
+  }
+  if (data === "anon:cancel") {
+    const q = await muatAntrean(io);
+    const idx = q.findIndex(e => e.uid === uid);
+    if (idx >= 0) {
+      q.splice(idx, 1);
+      await simpanAntrean(io, q);
+      await io.send(chatId,
+        "❌ Search cancelled. Tap 💬 Anonymous Chat whenever you " +
+        "want to try again.", MENU_MARKUP);
+    }
+    return;
+  }
+  if (data === "anon:repok") { await anonLaporKirim(io, chatId, uid); return; }
+  if (data === "anon:repback") {
+    await io.send(chatId, "↩️ Okay — your chat continues. Stay safe.");
     return;
   }
 
@@ -2412,6 +2780,16 @@ export async function handleUpdate(io, update) {
     return;
   }
 
+  // Anonymous Chat hook (private chats only): while a user is
+  // paired, their messages belong to the session — relayed or the
+  // three session controls — and while they wait in the partner
+  // queue most input just reminds them. Runs after the ban gate, so
+  // a banned user's media cannot slip into a session either.
+  if (tipeChat === "private" &&
+      (await sesiAnonHook(io, msg, chatId, uid))) {
+    return;
+  }
+
   const text = (msg.text || "").trim();
   if (!text) return;
   const rendah = text.toLowerCase();
@@ -2457,12 +2835,12 @@ export async function handleUpdate(io, update) {
     await tampilGrupSaya(io, chatId, uid);
     return;
   }
-  if (text === "💬 Anonymous Chat") {
+  if (perintah === "/anon" || text === "💬 Anonymous Chat") {
     if (!(await modulAktif(io, "anon"))) {
       await pesanModulOff(io, chatId, "anon");
       return;
     }
-    await io.send(chatId, TEKS_ANON_SOON, MENU_MARKUP);
+    await masukAnon(io, chatId, uid);
     return;
   }
 
@@ -2593,6 +2971,13 @@ export function buatIo(env) {
       if (text) body.text = text;
       try { await tg("answerCallbackQuery", body); }
       catch (e) { /* a stale button tap must not break the flow */ }
+    },
+    // copyMessage renders the content as the bot's own message in
+    // the partner's chat: no forward header and no trace of the
+    // sender — the anonymous relay of Phase 3.
+    copyMsg: async (fromChatId, toChatId, messageId) => {
+      await tg("copyMessage", { chat_id: toChatId,
+        from_chat_id: fromChatId, message_id: messageId });
     },
     // ---- group moderation calls (Phase 2) ----
     getChatMember: async (chatId, userId) => {
