@@ -1,0 +1,44 @@
+name: wesio-eksekusi
+
+# Eksekutor WesioBot: workflow ini TIDAK berjalan berkala. Ia dipicu
+# on-demand oleh Worker (webhook Telegram) lewat workflow_dispatch begitu
+# pengguna memilih format unduhan. Input hanya job_id — data job (tautan
+# unduhan) diambil dari Cloudflare KV oleh executor/executor_job.py lalu
+# job-nya dihapus. Tidak ada data pengguna yang menjadi input workflow
+# (input terlihat di UI Actions).
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "ID job di Cloudflare KV"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wesio-eksekusi
+  cancel-in-progress: false
+
+jobs:
+  eksekusi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pasang dependensi
+        run: pip install -r executor/requirements.txt
+
+      - name: Jalankan eksekutor job
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NS_ID: ${{ secrets.CF_KV_NS_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: python -m executor.executor_job
