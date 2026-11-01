@@ -2,8 +2,6 @@ name = "wesio"
 main = "worker.js"
 compatibility_date = "2024-11-01"
 
-# Binding KV dibuat saat aktivasi: buat namespace KV bernama "wesio"
-# lalu aktifkan blok di bawah dengan id-nya (lihat PANDUAN-DEPLOY.md).
-# [[kv_namespaces]]
-# binding = "WKV"
-# id = "<id-namespace-kv-wesio>"
+[[kv_namespaces]]
+binding = "WKV"
+id = "ef012f1fdd0e42cbb310756905e93563"
