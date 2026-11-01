@@ -444,5 +444,188 @@ console.log("15) Ban: alur penuh, non-admin ditolak, admin tak bisa mem-ban diri
       terakhir(W).text.includes("I'm Wesio"), terakhir(W).text.slice(0, 100));
 }
 
+console.log("16) BYOK auto-detect: tempel kunci -> provider ketemu sendiri; model gratis dipilih");
+{
+  // (a) Panel menonjolkan tombol Paste; tombol manual tetap ada.
+  const Wp = buatIo({ ai: AI_ON });
+  await handleUpdate(Wp.io, cb(16000, "byok:open"));
+  const panelBtns = (terakhir(Wp).markup?.inline_keyboard || []).flat();
+  const panelCb = panelBtns.map(b => b.callback_data);
+  cek("panel: tombol utama '📋 Paste my API key' tampil pertama",
+      panelBtns[0]?.callback_data === "byok:paste" &&
+      panelBtns[0]?.text.includes("Paste my API key"),
+      JSON.stringify(panelBtns.map(b => b.text)));
+  cek("panel: tombol provider manual tetap ada sebagai cadangan",
+      panelCb.includes("byok:provider:openai") &&
+      panelCb.includes("byok:provider:openrouter") &&
+      panelCb.includes("byok:provider:gemini"), JSON.stringify(panelCb));
+  cek("panel: teks menjelaskan deteksi otomatis",
+      terakhir(Wp).text.includes("detect"), terakhir(Wp).text.slice(0, 200));
+  await handleUpdate(Wp.io, cb(16000, "byok:paste"));
+  cek("ketuk Paste -> diminta kirim kunci + janji dideteksi otomatis",
+      terakhir(Wp).text.includes("detect it from the key"),
+      terakhir(Wp).text.slice(0, 200));
+
+  // (b) Kunci "AIza…" gratisan -> terdeteksi Gemini tanpa pilih provider.
+  const W = buatIo({ ai: AI_ON, testKey: (base) =>
+    base.includes("googleapis")
+      ? { ok: true }
+      : { ok: false, reason: "rejected" } });
+  await handleUpdate(W.io, cb(16001, "byok:paste"));
+  await handleUpdate(W.io, msg(16001, "AIzaSy-gratis-123"));
+  cek("AIza…: kandidat pertama yang diuji adalah Gemini",
+      W.keyTests.length >= 1 &&
+      W.keyTests[0].base.includes("googleapis"),
+      JSON.stringify(W.keyTests.map(k => k.base)));
+  cek("AIza…: konfirmasi menyebut terdeteksi sebagai Google Gemini",
+      terakhir(W).text.includes("detected it as a Google Gemini key"),
+      terakhir(W).text.slice(0, 250));
+  const recG = JSON.parse(W.kv.get("apikey:16001") || "{}");
+  cek("AIza…: record {provider gemini, base gemini, model gemini-2.0-flash}",
+      recG.provider === "gemini" && recG.base.includes("googleapis") &&
+      recG.model === "gemini-2.0-flash" && recG.key === "AIzaSy-gratis-123",
+      JSON.stringify({ p: recG.provider, m: recG.model }));
+  cek("AIza…: konfirmasi menyebut model + tingkat gratis Gemini",
+      terakhir(W).text.includes("gemini-2.0-flash") &&
+      terakhir(W).text.includes("free tier"), terakhir(W).text.slice(0, 300));
+  await handleUpdate(W.io, msg(16001, "🤖 AI Chat"));
+  await handleUpdate(W.io, msg(16001, "halo"));
+  const callG = W.aiCalls[W.aiCalls.length - 1];
+  cek("AIza…: chat jalan memakai model tersimpan, tanpa potong kuota",
+      !!callG && callG.model === "gemini-2.0-flash" &&
+      callG.key === "AIzaSy-gratis-123" &&
+      !W.kv.has(`quota:16001:ai:${hariIniUTC()}`),
+      JSON.stringify(callG && { m: callG.model }));
+  cek("nilai kunci AIza tidak muncul di pesan keluar",
+      !semua(W).includes("AIzaSy-gratis-123"), "");
+
+  // (c) Kunci "sk-or-…" -> OpenRouter + model ":free" pertama dipilih.
+  const Wo = buatIo({ ai: AI_ON, testKey: (base) =>
+    base.includes("openrouter")
+      ? { ok: true, models: ["openai/gpt-4o-mini",
+          "meta-llama/llama-3.1-8b:free", "google/gemma-2-9b:free"] }
+      : { ok: false, reason: "rejected" } });
+  await handleUpdate(Wo.io, cb(16002, "byok:paste"));
+  await handleUpdate(Wo.io, msg(16002, "sk-or-v1-gratis"));
+  const recO = JSON.parse(Wo.kv.get("apikey:16002") || "{}");
+  cek("sk-or-…: terdeteksi OpenRouter (diuji pertama)",
+      recO.provider === "openrouter" &&
+      Wo.keyTests[0].base.includes("openrouter"),
+      JSON.stringify({ p: recO.provider, t: Wo.keyTests.map(k => k.base) }));
+  cek("sk-or-…: model ':free' PERTAMA dari daftar provider yang disimpan",
+      recO.model === "meta-llama/llama-3.1-8b:free", recO.model || "kosong");
+  cek("sk-or-…: konfirmasi menyebut 'free model' + nama modelnya",
+      terakhir(Wo).text.includes("free model") &&
+      terakhir(Wo).text.includes("meta-llama/llama-3.1-8b:free"),
+      terakhir(Wo).text.slice(0, 300));
+  await handleUpdate(Wo.io, msg(16002, "🤖 AI Chat"));
+  await handleUpdate(Wo.io, msg(16002, "halo"));
+  const callO = Wo.aiCalls[Wo.aiCalls.length - 1];
+  cek("sk-or-…: chat memakai model :free tersimpan via kunci pengguna",
+      !!callO && callO.model === "meta-llama/llama-3.1-8b:free" &&
+      callO.base === "https://openrouter.ai/api/v1",
+      JSON.stringify(callO && { m: callO.model, b: callO.base }));
+
+  // (c2) OpenRouter tanpa model ":free" di daftar -> default provider.
+  const Wo2 = buatIo({ ai: AI_ON, testKey: (base) =>
+    base.includes("openrouter")
+      ? { ok: true, models: ["openai/gpt-4o-mini", "anthropic/claude"] }
+      : { ok: false, reason: "rejected" } });
+  await handleUpdate(Wo2.io, cb(16003, "byok:paste"));
+  await handleUpdate(Wo2.io, msg(16003, "sk-or-v1-bayar"));
+  const recO2 = JSON.parse(Wo2.kv.get("apikey:16003") || "{}");
+  cek("sk-or-… tanpa ':free': model default OpenRouter disimpan, tanpa klaim gratis",
+      recO2.model === "openai/gpt-4o-mini" &&
+      !terakhir(Wo2).text.includes("free model"), recO2.model || "kosong");
+
+  // (d) Kunci "sk-…" yang hanya diterima OpenAI -> OpenAI; bila OpenAI
+  // menolak, urutan lanjut ke OpenRouter.
+  const Wd = buatIo({ ai: AI_ON, testKey: (base, key) =>
+    base.includes("api.openai.com") && key === "sk-plain-openai"
+      ? { ok: true } : { ok: false, reason: "rejected" } });
+  await handleUpdate(Wd.io, cb(16004, "byok:paste"));
+  await handleUpdate(Wd.io, msg(16004, "sk-plain-openai"));
+  const recD = JSON.parse(Wd.kv.get("apikey:16004") || "{}");
+  cek("sk-…: OpenAI diuji pertama dan terdeteksi sebagai OpenAI",
+      recD.provider === "openai" &&
+      Wd.keyTests.length === 1 && Wd.keyTests[0].base.includes("api.openai.com"),
+      JSON.stringify({ p: recD.provider, t: Wd.keyTests.map(k => k.base) }));
+  cek("sk-… OpenAI: konfirmasi menyebut model + catatan TANPA tingkat gratis",
+      terakhir(Wd).text.includes("gpt-4o-mini") &&
+      terakhir(Wd).text.includes("no free tier"), terakhir(Wd).text.slice(0, 350));
+
+  const Wd2 = buatIo({ ai: AI_ON, testKey: (base) =>
+    base.includes("openrouter")
+      ? { ok: true, models: [] }
+      : { ok: false, reason: "rejected" } });
+  await handleUpdate(Wd2.io, cb(16005, "byok:paste"));
+  await handleUpdate(Wd2.io, msg(16005, "sk-hanya-or"));
+  const recD2 = JSON.parse(Wd2.kv.get("apikey:16005") || "{}");
+  cek("sk-… ditolak OpenAI -> urutan lanjut, terdeteksi OpenRouter",
+      recD2.provider === "openrouter" &&
+      Wd2.keyTests.length === 2 &&
+      Wd2.keyTests[0].base.includes("api.openai.com") &&
+      Wd2.keyTests[1].base.includes("openrouter"),
+      JSON.stringify(Wd2.keyTests.map(k => k.base)));
+
+  // (e) Kunci ditolak semua provider -> tidak disimpan, urutan default
+  // untuk awalan tak dikenal: Gemini, OpenAI, OpenRouter.
+  const We = buatIo({ ai: AI_ON });
+  await handleUpdate(We.io, cb(16006, "byok:paste"));
+  await handleUpdate(We.io, msg(16006, "zzz-tidak-jelas"));
+  cek("ditolak semua: pesan 'not accepted by any' + saran pilih manual",
+      terakhir(We).text.includes("not accepted by any") &&
+      terakhir(We).text.includes("pick your provider manually"),
+      terakhir(We).text.slice(0, 250));
+  cek("ditolak semua: TIDAK tersimpan di KV", !We.kv.has("apikey:16006"), "");
+  cek("awalan tak dikenal: urutan uji Gemini -> OpenAI -> OpenRouter",
+      We.keyTests.length === 3 &&
+      We.keyTests[0].base.includes("googleapis") &&
+      We.keyTests[1].base.includes("api.openai.com") &&
+      We.keyTests[2].base.includes("openrouter"),
+      JSON.stringify(We.keyTests.map(k => k.base)));
+
+  // (f) Semua kandidat tak terjangkau -> pesan berbeda, tidak disimpan.
+  const Wf = buatIo({ ai: AI_ON,
+    testKey: () => ({ ok: false, reason: "unreachable" }) });
+  await handleUpdate(Wf.io, cb(16007, "byok:paste"));
+  await handleUpdate(Wf.io, msg(16007, "sk-or-v1-apa"));
+  cek("semua tak terjangkau: pesan 'couldn't reach the providers'",
+      terakhir(Wf).text.includes("couldn't reach the providers") &&
+      !terakhir(Wf).text.includes("not accepted by any"),
+      terakhir(Wf).text.slice(0, 200));
+  cek("semua tak terjangkau: TIDAK tersimpan", !Wf.kv.has("apikey:16007"), "");
+
+  // (g) Alur manual tetap berfungsi dari panel baru (regresi eksplisit).
+  const Wm = buatIo({ ai: AI_ON });
+  await handleUpdate(Wm.io, cb(16008, "byok:open"));
+  await handleUpdate(Wm.io, cb(16008, "byok:provider:gemini"));
+  await handleUpdate(Wm.io, msg(16008, "sk-good-manual"));
+  const recM = JSON.parse(Wm.kv.get("apikey:16008") || "{}");
+  cek("manual dari panel baru: provider Gemini dipilih -> record lama {provider, base, key}",
+      recM.provider === "gemini" && recM.key === "sk-good-manual" &&
+      terakhir(Wm).text.includes("passed the test"),
+      terakhir(Wm).text.slice(0, 200));
+
+  // (h) Kunci sendiri kena 402 saat dipakai -> saran pasang ulang agar
+  // deteksi memilih model gratis; tanpa teks teknis.
+  const Wh = buatIo({ ai: AI_ON, byokFailStatus: 402 });
+  Wh.kv.set("apikey:16009", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-good-habis", model: "openai/gpt-4o-mini" }));
+  await handleUpdate(Wh.io, msg(16009, "/ai"));
+  await handleUpdate(Wh.io, msg(16009, "halo"));
+  const btns402 = (terakhir(Wh).markup?.inline_keyboard || [])
+    .flat().map(b => b.callback_data);
+  cek("402: pesan menyebut kredit/model berbayar + saran tempel ulang",
+      terakhir(Wh).text.includes("no credit for that model") &&
+      terakhir(Wh).text.includes("free model"), terakhir(Wh).text.slice(0, 300));
+  cek("402: tombol Paste ditawarkan untuk pasang ulang",
+      btns402.includes("byok:paste"), JSON.stringify(btns402));
+  cek("402: tanpa angka/teks teknis di pesan pengguna",
+      !terakhir(Wh).text.includes("402") &&
+      !/http|error/i.test(terakhir(Wh).text), terakhir(Wh).text.slice(0, 200));
+}
+
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);
 process.exit(gagal ? 1 : 0);

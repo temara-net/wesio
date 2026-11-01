@@ -18,8 +18,13 @@
 //
 // AI keys come in two flavours: the system key (env AI_*, daily quota)
 // or the user's own key (BYOK, saved per user in KV apikey:<uid> after a
-// live test against their provider; BYOK chats use the provider's
-// default model and never consume the system quota).
+// live test against their provider; BYOK chats use the saved model and
+// never consume the system quota). Installing a key needs no provider
+// pick: the user just pastes the key and the provider is auto-detected
+// from it (manual per-provider picking stays available as a fallback).
+// Free keys must work too: Gemini keys land on a free-tier model, and
+// OpenRouter keys are matched to a ":free" model from the provider's
+// own list when one exists.
 //
 // Worker env/secrets: TG_BOT_TOKEN, ADMIN_ID, GH_TOKEN (fine-grained PAT,
 // repo wesio only, Actions read/write), WEBHOOK_SECRET (optional),
@@ -95,6 +100,23 @@ const BYOK_OFFER_MARKUP = {
 const BYOK_REMOVE_MARKUP = {
   inline_keyboard: [[
     { text: "🗑 Remove my key", callback_data: "byok:remove" }]],
+};
+
+// The one main action of the key panel: paste a key, provider is
+// auto-detected. Manual provider buttons stay below it as a fallback.
+const BYOK_PASTE_MARKUP = {
+  inline_keyboard: [
+    [{ text: "📋 Paste my API key", callback_data: "byok:paste" }],
+    ...BYOK_PROVIDER_BUTTONS,
+  ],
+};
+
+const BYOK_PASTE_REMOVE_MARKUP = {
+  inline_keyboard: [
+    [{ text: "📋 Paste my API key", callback_data: "byok:paste" }],
+    [{ text: "🗑 Remove my key", callback_data: "byok:remove" }],
+    ...BYOK_PROVIDER_BUTTONS,
+  ],
 };
 
 // ---------------- module switches & bans (admin) ----------------
@@ -268,7 +290,10 @@ async function sisaDl(io, uid, prem) {
   return Math.max(0, batasDl(prem) - (await kuotaTerpakai(io, uid, "dl")));
 }
 
-// ---- user API key (BYOK): {provider, base, key} in KV apikey:<uid> ----
+// ---- user API key (BYOK) in KV apikey:<uid> ----
+// Manual installs store {provider, base, key}; auto-detected installs
+// also store the chosen model as {…, model}. Reading code always falls
+// back to the provider default when no model was stored.
 async function muatKunci(io, uid) {
   try {
     const v = await io.kvGet("apikey:" + uid);
@@ -437,11 +462,12 @@ async function prosesAi(io, chatId, uid, teks) {
     ]);
   }
 
-  // With the user's own key: their provider's default model, their
+  // With the user's own key: the model saved with the key (chosen by
+  // auto-detection, free where the provider offers it), their
   // credentials, and no Wesio quota. Otherwise the system key + quota.
   const provKunci = kunci ? BYOK_PROVIDERS[kunci.provider] : null;
   const model = kunci
-    ? (provKunci ? provKunci.model : io.ai.modelFast)
+    ? (kunci.model || (provKunci ? provKunci.model : io.ai.modelFast))
     : (c.aiModel === "strong" && prem && io.ai.modelStrong
       ? io.ai.modelStrong : io.ai.modelFast);
   let jawaban;
@@ -449,6 +475,22 @@ async function prosesAi(io, chatId, uid, teks) {
     jawaban = await io.callAI(messages, model,
       kunci ? { base: kunci.base, key: kunci.key } : null);
   } catch (e) {
+    if (kunci && e && e.status === 402) {
+      // The provider says this key has no credit for that model —
+      // the classic free-key-on-a-paid-model case. Re-installing via
+      // auto-detection picks a free model when one exists.
+      const namaProv = provKunci ? provKunci.name : "Your provider";
+      await io.send(chatId,
+        `${namaProv} says your own API key has no credit for that ` +
+        "model — this often happens when a free key is used with a " +
+        "paid model.\n\n" +
+        "Easy fix: paste your key again via 📋 Paste my API key " +
+        "below. My auto-detection will pick a free model for your " +
+        "key when your provider offers one. Or remove your key and " +
+        "return to the Wesio system key.",
+        BYOK_PASTE_REMOVE_MARKUP);
+      return;
+    }
     if (kunci && e && [401, 403, 429].includes(e.status)) {
       const namaProv = provKunci ? provKunci.name : "Your provider";
       await io.send(chatId,
@@ -494,17 +536,19 @@ async function tampilByok(io, chatId, uid) {
   const kunci = await muatKunci(io, uid);
   if (kunci) {
     const prov = BYOK_PROVIDERS[kunci.provider];
+    const modelAktif = kunci.model || (prov ? prov.model : "");
     await io.send(chatId,
       "🔑 My API Key\n\n" +
       `Status: active — your own ${prov ? prov.name : "provider"} key is ` +
       "in use for AI Chat, so the Wesio daily quota does not apply to " +
-      "you.\n\n" +
+      "you.\n" +
+      (modelAktif ? `Model in use: ${modelAktif}\n` : "") +
+      "\n" +
       "Your key value is never shown here or anywhere else. You can " +
-      "remove it at any time, or replace it by picking a provider below.",
-      { inline_keyboard: [
-        [{ text: "🗑 Remove my key", callback_data: "byok:remove" }],
-        ...BYOK_PROVIDER_BUTTONS,
-      ] });
+      "remove it at any time, or replace it — just paste a new key " +
+      "below and I will detect its provider automatically (or pick a " +
+      "provider manually).",
+      BYOK_PASTE_REMOVE_MARKUP);
     return;
   }
   await io.send(chatId,
@@ -513,10 +557,12 @@ async function tampilByok(io, chatId, uid) {
     "key with a daily quota.\n\n" +
     "Want unlimited use on your own account? Add your own API key: " +
     "your chats then run on your key and never touch the Wesio quota. " +
-    "The key is tested with your provider before it is saved, and it " +
+    "Free keys work too. The key is tested before it is saved, and it " +
     "is never displayed anywhere.\n\n" +
-    "Pick your provider to begin:",
-    { inline_keyboard: BYOK_PROVIDER_BUTTONS });
+    "Easiest way: tap 📋 Paste my API key below and send your key — " +
+    "I detect whether it belongs to OpenAI, OpenRouter or Google " +
+    "Gemini all by myself. Or pick a provider manually:",
+    BYOK_PASTE_MARKUP);
 }
 
 async function mulaiPasangKunci(io, chatId, uid, kodeProvider) {
@@ -536,11 +582,120 @@ async function mulaiPasangKunci(io, chatId, uid, kodeProvider) {
     "Changed your mind? Just tap 🤖 AI Chat below instead.");
 }
 
+async function mulaiTempelKunci(io, chatId, uid) {
+  const c = await muatConv(io, uid);
+  c.mode = "ai_await_key";
+  c.byokProvider = "auto";
+  await simpanConv(io, uid, c);
+  await io.send(chatId,
+    "📋 Paste your API key\n\n" +
+    "Send me your API key as a single message — from OpenAI, " +
+    "OpenRouter or Google Gemini, free keys included. You do NOT " +
+    "need to tell me which provider: I detect it from the key " +
+    "itself, test it, and only save it if a provider accepts it.\n\n" +
+    "Tip: after the key is saved, you can delete that message from " +
+    "this chat. It is never stored in your conversation history " +
+    "here, and it never appears in any reply.\n\n" +
+    "Changed your mind? Just tap 🤖 AI Chat below instead.");
+}
+
+// Candidate order for auto-detection, from the key's prefix hint:
+// "AIza…" → Gemini first; "sk-or-…" → OpenRouter first; "sk-…" →
+// OpenAI then OpenRouter; anything else → Gemini, OpenAI, OpenRouter.
+function urutanDeteksi(kandidat) {
+  if (kandidat.startsWith("AIza")) return ["gemini", "openai", "openrouter"];
+  if (kandidat.startsWith("sk-or-")) return ["openrouter", "openai", "gemini"];
+  if (kandidat.startsWith("sk-")) return ["openai", "openrouter", "gemini"];
+  return ["gemini", "openai", "openrouter"];
+}
+
+// Try each candidate with the live key test; the first provider that
+// accepts the key owns it. Returns {kode, models} on success, or
+// {gagal: "rejected"} when at least one provider actively refused the
+// key, {gagal: "unreachable"} when every candidate was unreachable.
+async function deteksiProvider(io, kandidat) {
+  let adaDitolak = false;
+  for (const kode of urutanDeteksi(kandidat)) {
+    const prov = BYOK_PROVIDERS[kode];
+    let hasil = null;
+    try { hasil = await io.testApiKey(prov.base, kandidat); }
+    catch (e) { hasil = { ok: false, reason: "unreachable" }; }
+    if (hasil && hasil.ok) return { kode, models: hasil.models };
+    if (hasil && hasil.reason === "rejected") adaDitolak = true;
+  }
+  return { gagal: adaDitolak ? "rejected" : "unreachable" };
+}
+
+// Model for an auto-detected key. Free keys must actually work, so
+// OpenRouter keys get the first ":free" model from the provider's own
+// list (falling back to the provider default when there is none).
+function modelDeteksi(kode, models) {
+  const prov = BYOK_PROVIDERS[kode];
+  if (kode === "openrouter" && Array.isArray(models)) {
+    const gratis = models.find(m =>
+      typeof m === "string" && m.endsWith(":free"));
+    if (gratis) return gratis;
+  }
+  return prov.model;
+}
+
 async function prosesKunciByok(io, chatId, uid, teks) {
   const c = await muatConv(io, uid);
+  const kandidat = (teks || "").trim();
+
+  // ---- auto-detect install: the user pasted a key, no provider pick --
+  if (c.byokProvider === "auto") {
+    const det = await deteksiProvider(io, kandidat);
+    if (det.gagal === "rejected") {
+      // Stay in awaiting mode so the user can simply paste another key.
+      await io.send(chatId,
+        "❌ That key was not accepted by any of the providers I " +
+        "support (OpenAI, OpenRouter or Google Gemini), so nothing " +
+        "was saved.\n\n" +
+        "Please check the key and paste it again — or open " +
+        "🔑 My API Key and pick your provider manually. Tap " +
+        "🤖 AI Chat below to cancel and keep using the Wesio system key.");
+      return;
+    }
+    if (det.gagal) {
+      await io.send(chatId,
+        "❌ I couldn't reach the providers to check that key just " +
+        "now, so nothing was saved.\n\n" +
+        "Please paste the key again in a moment — or tap 🤖 AI Chat " +
+        "below to cancel.");
+      return;
+    }
+    const prov = BYOK_PROVIDERS[det.kode];
+    const model = modelDeteksi(det.kode, det.models);
+    await io.kvPut("apikey:" + uid, JSON.stringify({
+      provider: det.kode, base: prov.base, key: kandidat, model,
+    }));
+    c.mode = "ai";
+    c.byokProvider = null;
+    await simpanConv(io, uid, c);
+    let barisModel = `Model used with your key: ${model}`;
+    if (model.endsWith(":free")) {
+      barisModel += " — a free model, so the provider does not " +
+        "charge for using it.";
+    } else if (det.kode === "gemini") {
+      barisModel += " — this model has a free tier at Google.";
+    } else if (det.kode === "openai") {
+      barisModel += "\nNote: OpenAI has no free tier — usage of this " +
+        "key is billed by OpenAI to your own account.";
+    }
+    await io.send(chatId,
+      `✅ Key accepted — I detected it as a ${prov.name} key, and ` +
+      "it is now active.\n\n" +
+      barisModel + "\n" +
+      "Your AI chats now run on your own key — no Wesio quota is " +
+      "used. Manage it anytime via 🔑 My API Key.",
+      AI_KEYBOARD);
+    return;
+  }
+
+  // ---- manual install: provider picked by the user (unchanged) ----
   const kode = c.byokProvider || "openai";
   const prov = BYOK_PROVIDERS[kode] || BYOK_PROVIDERS.openai;
-  const kandidat = (teks || "").trim();
   let hasil = null;
   try { hasil = await io.testApiKey(prov.base, kandidat); }
   catch (e) { hasil = { ok: false, reason: "unreachable" }; }
@@ -874,6 +1029,7 @@ async function handleCallback(io, cq) {
   if (data === "buy:premium") { await beliPremium(io, chatId, uid); return; }
 
   if (data === "byok:open") { await tampilByok(io, chatId, uid); return; }
+  if (data === "byok:paste") { await mulaiTempelKunci(io, chatId, uid); return; }
   if (data === "byok:remove") { await hapusKunci(io, chatId, uid); return; }
   if (data.startsWith("byok:provider:")) {
     await mulaiPasangKunci(io, chatId, uid, data.slice("byok:provider:".length));
@@ -1173,6 +1329,8 @@ function buatIo(env) {
       return content;
     },
     // Light key check used before a BYOK key is saved: GET /models.
+    // On success the model id list is included when the provider
+    // returns one — auto-detection uses it to pick a ":free" model.
     testApiKey: async (base, key) => {
       let r;
       try {
@@ -1183,7 +1341,18 @@ function buatIo(env) {
       } catch (e) {
         return { ok: false, reason: "unreachable" };
       }
-      if (r.ok) return { ok: true };
+      if (r.ok) {
+        try {
+          const data = await r.json();
+          const models = data && Array.isArray(data.data)
+            ? data.data.map(m => m && m.id)
+                .filter(x => typeof x === "string")
+            : null;
+          return models ? { ok: true, models } : { ok: true };
+        } catch (e) {
+          return { ok: true };
+        }
+      }
       if (r.status === 401 || r.status === 403) {
         return { ok: false, reason: "rejected" };
       }
