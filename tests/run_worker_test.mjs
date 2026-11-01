@@ -25,6 +25,7 @@ function buatIo(opts = {}) {
   const prechecks = [];
   const dispatches = [];
   const aiCalls = [];
+  const keyTests = [];
   const io = {
     adminId: opts.adminId ?? 111,
     ai: opts.ai ?? AI_OFF,
@@ -38,11 +39,29 @@ function buatIo(opts = {}) {
     answerPreCheckout: async (id, ok, err) => { prechecks.push({ id, ok, err }); },
     answerCallback: async () => {},
     fetchText: async (url) => ({ url, status: 200, text: "<html><body>isi artikel</body></html>" }),
-    callAI: async (messages, model) => { aiCalls.push({ messages, model }); return "Mock AI answer."; },
+    callAI: async (messages, model, creds) => {
+      aiCalls.push({ messages, model,
+        base: creds ? creds.base : null, key: creds ? creds.key : null });
+      if (creds && opts.byokFailStatus) {
+        const e = new Error("AI HTTP " + opts.byokFailStatus);
+        e.status = opts.byokFailStatus;
+        throw e;
+      }
+      return "Mock AI answer.";
+    },
+    // Tiruan uji kunci provider: "sk-good*" lulus, "sk-down*" tak
+    // terjangkau, selain itu ditolak. opts.testKey menimpa aturan ini.
+    testApiKey: async (base, key) => {
+      keyTests.push({ base, key });
+      if (opts.testKey) return opts.testKey(base, key);
+      if (key.includes("down")) return { ok: false, reason: "unreachable" };
+      if (key.startsWith("sk-good")) return { ok: true };
+      return { ok: false, reason: "rejected" };
+    },
     genImage: async () => "https://img.invalid/pic.png",
     dispatch: async (jobId) => { dispatches.push(jobId); },
   };
-  return { io, kv, terkirim, invoices, prechecks, dispatches, aiCalls };
+  return { io, kv, terkirim, invoices, prechecks, dispatches, aiCalls, keyTests };
 }
 
 let seq = 0;
@@ -233,6 +252,196 @@ console.log("10) /admin_stats: non-admin ditolak, admin dapat laporan");
   cek("admin menerima laporan (pengguna terdaftar terhitung)",
       terakhir(W).text.includes("Registered users: 2") &&
       terakhir(W).text.includes("Premium active:"), terakhir(W).text);
+}
+
+console.log("11) BYOK: kunci ditolak/tak terjangkau TIDAK disimpan; kunci lulus disimpan");
+{
+  const W = buatIo({ ai: AI_ON });
+  await handleUpdate(W.io, cb(11001, "byok:open"));
+  cek("panel BYOK tanpa kunci: status 'no key saved'",
+      terakhir(W).text.includes("no key saved"), terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, cb(11001, "byok:provider:openai"));
+  cek("pilih provider -> diminta kirim kunci + janji dites dulu",
+      terakhir(W).text.includes("OpenAI") &&
+      terakhir(W).text.includes("only saved if the test passes"), terakhir(W).text.slice(0, 200));
+  await handleUpdate(W.io, msg(11001, "sk-bad-111"));
+  cek("kunci ditolak provider -> pesan manusia 'rejected'",
+      terakhir(W).text.includes("rejected that key"), terakhir(W).text.slice(0, 150));
+  cek("kunci ditolak -> TIDAK tersimpan di KV", !W.kv.has("apikey:11001"), [...W.kv.keys()].join(","));
+  cek("tes kunci benar-benar dipanggil ke base OpenAI",
+      W.keyTests.length === 1 && W.keyTests[0].base === "https://api.openai.com/v1",
+      JSON.stringify(W.keyTests.map(k => k.base)));
+  await handleUpdate(W.io, msg(11001, "sk-down-222"));
+  cek("provider tak terjangkau -> pesan beda + tetap tidak tersimpan",
+      terakhir(W).text.includes("couldn't reach") && !W.kv.has("apikey:11001"),
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(11001, "sk-good-333"));
+  cek("kunci lulus tes -> konfirmasi + model default provider disebut",
+      terakhir(W).text.includes("passed the test") &&
+      terakhir(W).text.includes("gpt-4o-mini"), terakhir(W).text.slice(0, 250));
+  const rec = JSON.parse(W.kv.get("apikey:11001") || "{}");
+  cek("record tersimpan {provider, base, key} persis",
+      rec.provider === "openai" && rec.base === "https://api.openai.com/v1" &&
+      rec.key === "sk-good-333", JSON.stringify(Object.keys(rec)));
+  cek("nilai kunci TIDAK PERNAH muncul di pesan keluar mana pun",
+      !semua(W).includes("sk-bad-111") && !semua(W).includes("sk-down-222") &&
+      !semua(W).includes("sk-good-333"), "");
+  cek("nilai kunci TIDAK masuk record percakapan/riwayat",
+      !(W.kv.get("conv:11001") || "").includes("sk-good-333"), W.kv.get("conv:11001") || "");
+}
+
+console.log("12) BYOK dipakai: model provider, tanpa potong kuota, catatan kaki; jalan walau sistem mati");
+{
+  const W = buatIo({ ai: AI_ON });
+  await handleUpdate(W.io, cb(12001, "byok:provider:openrouter"));
+  await handleUpdate(W.io, msg(12001, "sk-good-ort"));
+  await handleUpdate(W.io, msg(12001, "🤖 AI Chat"));
+  cek("intro AI menyebut kunci sendiri aktif (OpenRouter)",
+      terakhir(W).text.includes("Your own OpenRouter API key is active"), terakhir(W).text.slice(-300));
+  await handleUpdate(W.io, msg(12001, "halo"));
+  const call = W.aiCalls[W.aiCalls.length - 1];
+  cek("panggilan AI memakai base+model+kunci pengguna",
+      !!call && call.base === "https://openrouter.ai/api/v1" &&
+      call.model === "openai/gpt-4o-mini" && call.key === "sk-good-ort",
+      JSON.stringify(call && { b: call.base, m: call.model }));
+  cek("jawaban memuat catatan kaki BYOK",
+      terakhir(W).text.includes("Using your own API key — no Wesio quota used"),
+      terakhir(W).text.slice(-200));
+  cek("kuota sistem TIDAK terpotong untuk pengguna BYOK",
+      !W.kv.has(`quota:12001:ai:${hariIniUTC()}`), [...W.kv.keys()].join(","));
+  await handleUpdate(W.io, cb(12001, "byok:open"));
+  cek("panel BYOK berkunci: status aktif menyebut provider, bukan nilai kunci",
+      terakhir(W).text.includes("Status: active") &&
+      terakhir(W).text.includes("OpenRouter") &&
+      !terakhir(W).text.includes("sk-good-ort"), terakhir(W).text.slice(0, 200));
+
+  const W2 = buatIo({ ai: AI_OFF });
+  W2.kv.set("apikey:12002", JSON.stringify({
+    provider: "gemini",
+    base: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    key: "sk-good-gem" }));
+  await handleUpdate(W2.io, msg(12002, "🤖 AI Chat"));
+  cek("sistem belum terkonfigurasi TAPI punya kunci -> modul AI tetap terbuka",
+      !terakhir(W2).text.includes("not switched on yet") &&
+      terakhir(W2).text.includes("Google Gemini"), terakhir(W2).text.slice(0, 200));
+  await handleUpdate(W2.io, msg(12002, "tes"));
+  cek("chat jalan dengan model default Gemini milik pengguna",
+      W2.aiCalls.length === 1 && W2.aiCalls[0].model === "gemini-2.0-flash",
+      JSON.stringify(W2.aiCalls.map(a => a.model)));
+}
+
+console.log("13) Kunci sendiri gagal saat dipakai (401) -> penjelasan + tawaran hapus; hapus -> jalur sistem");
+{
+  const W = buatIo({ ai: AI_ON, byokFailStatus: 401 });
+  W.kv.set("apikey:13001", JSON.stringify({
+    provider: "openai", base: "https://api.openai.com/v1", key: "sk-good-mati" }));
+  await handleUpdate(W.io, msg(13001, "/ai"));
+  await handleUpdate(W.io, msg(13001, "halo"));
+  cek("provider menolak kunci saat dipakai -> pesan manusia menyebut itu jawaban provider",
+      terakhir(W).text.includes("answered with an error for your own API key"),
+      terakhir(W).text.slice(0, 250));
+  const btns = (terakhir(W).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+  cek("pesan gagal menawarkan tombol Remove my key",
+      btns.includes("byok:remove"), JSON.stringify(btns));
+  await handleUpdate(W.io, cb(13001, "byok:remove"));
+  cek("hapus kunci -> konfirmasi penghapusan",
+      terakhir(W).text.includes("has been removed"), terakhir(W).text.slice(0, 150));
+  cek("record kunci terhapus dari KV", !W.kv.has("apikey:13001"), "");
+  await handleUpdate(W.io, msg(13001, "halo lagi"));
+  const call = W.aiCalls[W.aiCalls.length - 1];
+  cek("sesudah hapus: kembali ke kunci sistem (model fast, tanpa kredensial pengguna)",
+      !!call && call.model === "fast-1" && call.key === null, JSON.stringify(call && { m: call.model }));
+  cek("kuota sistem kembali terpotong normal",
+      W.kv.get(`quota:13001:ai:${hariIniUTC()}`) === "1", "");
+}
+
+console.log("14) Saklar modul: non-admin ditolak; modul off -> pesan jujur, kuota utuh");
+{
+  const W = buatIo({ ai: AI_ON, adminId: 111 });
+  await handleUpdate(W.io, msg(14009, "/admin_modules"));
+  cek("non-admin /admin_modules ditolak",
+      terakhir(W).text.includes("only available to the bot's admin"), terakhir(W).text.slice(0, 120));
+  await handleUpdate(W.io, cb(14009, "admin:mod:ai"));
+  cek("non-admin menekan saklar ditolak + config tidak berubah",
+      terakhir(W).text.includes("only available to the bot's admin") &&
+      !W.kv.has("config:modules"), terakhir(W).text.slice(0, 120));
+  await handleUpdate(W.io, msg(111, "/admin_modules"));
+  const panelBtns = (terakhir(W).markup?.inline_keyboard || []).flat();
+  cek("admin menerima panel 4 saklar, semua ON di awal",
+      panelBtns.length === 4 &&
+      panelBtns.every(b => b.text.includes("✅ ON")), JSON.stringify(panelBtns.map(b => b.text)));
+  await handleUpdate(W.io, cb(111, "admin:mod:ai"));
+  const panelSesudah = (terakhir(W).markup?.inline_keyboard || []).flat().map(b => b.text);
+  cek("saklar AI ditekan -> panel baru menampilkan OFF",
+      panelSesudah.some(t => t.includes("AI Chat: ⏸ OFF")) &&
+      panelSesudah.filter(t => t.includes("✅ ON")).length === 3,
+      JSON.stringify(panelSesudah));
+  const cfg = JSON.parse(W.kv.get("config:modules") || "{}");
+  cek("config tersimpan di KV config:modules (ai=false, lain tetap true)",
+      cfg.ai === false && cfg.download === true && cfg.groups === true && cfg.anon === true,
+      JSON.stringify(cfg));
+  await handleUpdate(W.io, msg(14001, "🤖 AI Chat"));
+  cek("modul AI off -> pengguna menerima pesan 'temporarily off'",
+      terakhir(W).text.includes("temporarily off"), terakhir(W).text.slice(0, 150));
+  cek("modul off -> AI tidak dipanggil & kuota tidak terpotong",
+      W.aiCalls.length === 0 && ![...W.kv.keys()].some(k => k.startsWith("quota:14001")),
+      [...W.kv.keys()].join(","));
+  await handleUpdate(W.io, cb(111, "admin:mod:download"));
+  await handleUpdate(W.io, msg(14001, "https://www.tiktok.com/@user/video/123"));
+  cek("modul download off -> tautan pun ditolak jujur, tanpa dispatch",
+      terakhir(W).text.includes("temporarily off") && W.dispatches.length === 0,
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, cb(111, "admin:mod:ai"));
+  await handleUpdate(W.io, msg(14001, "🤖 AI Chat"));
+  cek("modul dinyalakan lagi -> pengguna dilayani kembali",
+      terakhir(W).text.includes("AI Chat") &&
+      terakhir(W).text.includes("left today: 15 of 15"), terakhir(W).text.slice(-200));
+}
+
+console.log("15) Ban: alur penuh, non-admin ditolak, admin tak bisa mem-ban diri sendiri");
+{
+  const W = buatIo({ ai: AI_ON, adminId: 111 });
+  await handleUpdate(W.io, msg(15001, "/start"));
+  cek("sebelum ban: pengguna dilayani normal",
+      terakhir(W).text.includes("I'm Wesio"), terakhir(W).text.slice(0, 100));
+  await handleUpdate(W.io, msg(15001, "/admin_ban 15002"));
+  cek("non-admin /admin_ban ditolak + tidak ada record ban",
+      terakhir(W).text.includes("only available to the bot's admin") &&
+      !W.kv.has("ban:15002"), terakhir(W).text.slice(0, 120));
+  await handleUpdate(W.io, msg(111, "/admin_ban 111"));
+  cek("admin mem-ban ID admin sendiri -> ditolak jelas",
+      terakhir(W).text.includes("admin cannot be") && !W.kv.has("ban:111"),
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(111, "/admin_ban abc"));
+  cek("argumen bukan angka -> petunjuk pemakaian, tanpa record",
+      terakhir(W).text.includes("Usage: /admin_ban") &&
+      ![...W.kv.keys()].some(k => k.startsWith("ban:")), terakhir(W).text.slice(0, 120));
+  await handleUpdate(W.io, msg(111, "/admin_ban 15001"));
+  cek("admin mem-ban pengguna -> konfirmasi + record ban:<uid>",
+      terakhir(W).text.includes("now banned") && W.kv.has("ban:15001"),
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(15001, "/start"));
+  cek("pengguna ter-ban: /start ditolak sopan",
+      terakhir(W).text.includes("has been suspended"), terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(15001, "⬇️ Downloader"));
+  cek("pengguna ter-ban: modul lain juga ditolak",
+      terakhir(W).text.includes("has been suspended") && W.dispatches.length === 0,
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, cb(15001, "nav:premium"));
+  cek("pengguna ter-ban: tombol inline pun ditolak",
+      terakhir(W).text.includes("has been suspended"), terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(111, "/admin_stats"));
+  cek("statistik admin memuat hitungan ter-ban + status modul",
+      terakhir(W).text.includes("Banned users: 1") &&
+      terakhir(W).text.includes("Modules:") &&
+      terakhir(W).text.includes("AI Chat on"), terakhir(W).text);
+  await handleUpdate(W.io, msg(111, "/admin_unban 15001"));
+  cek("unban -> konfirmasi + record terhapus",
+      terakhir(W).text.includes("no longer banned") && !W.kv.has("ban:15001"),
+      terakhir(W).text.slice(0, 150));
+  await handleUpdate(W.io, msg(15001, "/start"));
+  cek("sesudah unban: pengguna dilayani lagi",
+      terakhir(W).text.includes("I'm Wesio"), terakhir(W).text.slice(0, 100));
 }
 
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);

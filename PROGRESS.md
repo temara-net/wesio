@@ -70,3 +70,62 @@ hasil uji yang benar-benar dijalankan di mesin ini.
   provider asli — semua menunggu tahap aktivasi sesudah kode ini
   diterima. Angka di atas adalah bukti uji lokal dengan tiruan,
   bukan bukti layanan asli.
+
+---
+
+# Tambahan 1 Nov 2026 — BYOK + Admin lengkap (konsep §10: saklar per modul)
+
+Keputusan pemilik yang diterapkan: model kunci AI dua jalur — kunci
+sistem (env AI_*, kuota harian) dan BYOK (pengguna membawa API key
+sendiri untuk memakai bebas tanpa kuota sistem).
+
+## Selesai (terbukti uji lokal — angka di bawah)
+- BYOK di `worker/worker.js`: tombol "🔑 My API Key" di papan AI;
+  panel status (belum ada kunci / aktif + nama provider saja); alur
+  pasang via preset OpenAI / OpenRouter / Gemini (endpoint
+  kompatibel-OpenAI) — kunci WAJIB lulus tes langsung ke provider
+  (GET /models) SEBELUM disimpan ke KV `apikey:<uid>`
+  {provider, base, key}; tes gagal → tidak disimpan + pesan manusia
+  (ditolak vs tak terjangkau dibedakan) + boleh coba lagi. Model BYOK
+  = default per provider (gpt-4o-mini / openai/gpt-4o-mini /
+  gemini-2.0-flash), disebut di konfirmasi. Pemakaian: panggilan AI
+  memakai base+kunci pengguna, kuota sistem tidak dipotong, jawaban
+  berkaki "🔑 Using your own API key — no Wesio quota used"; modul AI
+  tetap terbuka bagi pemegang kunci walau kunci sistem belum
+  terkonfigurasi. Gagal pakai (401/403/429) → pesan manusia bahwa itu
+  jawaban provider kunci pengguna + tombol "🗑 Remove my key";
+  tombol hapus juga ada di panel. Pesan berisi kunci tidak masuk
+  riwayat chat KV; nilai kunci tidak muncul di pesan keluar mana pun
+  (diuji), tidak masuk log.
+- Admin lengkap: /admin_modules (panel 4 saklar inline, KV
+  `config:modules`, default semua on) — modul off → pesan jujur
+  "temporarily off", kuota tidak dipotong; /admin_ban <uid> &
+  /admin_unban <uid> (KV `ban:<uid>`; pengguna ter-ban ditolak semua
+  modul termasuk tombol inline; admin tidak bisa mem-ban dirinya);
+  /admin_stats ditambah hitungan pengguna ter-ban + status modul.
+
+## Hasil uji (dijalankan di mesin ini, sesudah perubahan)
+- `node tests/run_worker_test.mjs` → **83 lulus, 0 gagal**
+  (40 uji lama regresi tetap lulus + 43 uji baru). Cakupan baru:
+  kunci ditolak provider tiruan → tidak tersimpan; provider tak
+  terjangkau → pesan beda + tidak tersimpan; kunci lulus → tersimpan
+  & dipakai (base/model/kunci benar) tanpa potong kuota + catatan
+  kaki; BYOK jalan saat kunci sistem kosong; panel status hanya
+  menyebut provider; kunci gagal 401 saat dipakai → penjelasan +
+  tawaran hapus; hapus kunci → kembali ke jalur sistem + kuota;
+  nilai kunci tidak muncul di pesan keluar/riwayat; saklar modul
+  non-admin ditolak, admin bisa on/off dan persisten, modul off
+  menolak AI & unduhan tanpa kuota/dispatch; ban alur penuh
+  (ditolak semua modul), non-admin ditolak /admin_ban &
+  /admin_modules, admin mem-ban diri sendiri ditolak, unban
+  memulihkan; statistik memuat ter-ban & status modul.
+- `python3 tests/run_executor_test.py` → **12 lulus, 0 gagal**
+  (tidak berubah; regresi bersih). `node --check worker/worker.js`
+  → OK. Audit nama pribadi di worker/ tests/ → nol temuan.
+
+## Belum terbukti untuk tambahan ini
+- Tes kunci BYOK terhadap provider ASLI (OpenAI/OpenRouter/Gemini
+  nyata) dan panggilan AI BYOK nyata — harness lokal memakai tiruan;
+  perilaku header/endpoint provider asli baru terbukti saat aktivasi.
+- Deploy tambahan ini ke Worker live — di luar lingkup tugas lokal
+  ini (belum di-push, belum di-deploy).
