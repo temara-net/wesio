@@ -13,7 +13,13 @@
 //   straight to the user's chat.
 //
 // The bot is PUBLIC: anyone may use it. ADMIN_ID (env) is only used for
-// the /admin_stats report and admin notices — it does not lock the bot.
+// admin commands (/admin_stats, /admin_modules, /admin_ban,
+// /admin_unban) — it does not lock the bot.
+//
+// AI keys come in two flavours: the system key (env AI_*, daily quota)
+// or the user's own key (BYOK, saved per user in KV apikey:<uid> after a
+// live test against their provider; BYOK chats use the provider's
+// default model and never consume the system quota).
 //
 // Worker env/secrets: TG_BOT_TOKEN, ADMIN_ID, GH_TOKEN (fine-grained PAT,
 // repo wesio only, Actions read/write), WEBHOOK_SECRET (optional),
@@ -60,8 +66,47 @@ const AI_KEYBOARD = {
      { text: "💡 Explain", callback_data: "ai:task:explain" }],
     [{ text: "🖼️ Image ⭐", callback_data: "ai:task:image" },
      { text: "🆕 New Chat", callback_data: "ai:new" }],
+    [{ text: "🔑 My API Key", callback_data: "byok:open" }],
   ],
 };
+
+// ---------------- BYOK (bring your own key) ----------------
+// Users may save their own provider API key: AI calls then run on their
+// key with that provider's default model and never touch the Wesio
+// system quota. Keys are tested against the provider BEFORE saving and
+// are never shown in any message, history entry or log line.
+export const BYOK_PROVIDERS = {
+  openai: { name: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  openrouter: { name: "OpenRouter", base: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
+  gemini: { name: "Google Gemini", base: "https://generativelanguage.googleapis.com/v1beta/openai/", model: "gemini-2.0-flash" },
+};
+
+const BYOK_PROVIDER_BUTTONS = [
+  [{ text: "OpenAI", callback_data: "byok:provider:openai" },
+   { text: "OpenRouter", callback_data: "byok:provider:openrouter" }],
+  [{ text: "Google Gemini", callback_data: "byok:provider:gemini" }],
+];
+
+const BYOK_OFFER_MARKUP = {
+  inline_keyboard: [[
+    { text: "🔑 Use my own API key", callback_data: "byok:open" }]],
+};
+
+const BYOK_REMOVE_MARKUP = {
+  inline_keyboard: [[
+    { text: "🗑 Remove my key", callback_data: "byok:remove" }]],
+};
+
+// ---------------- module switches & bans (admin) ----------------
+const MODULE_NAMES = ["ai", "download", "groups", "anon"];
+const MODULE_LABELS = {
+  ai: "🤖 AI Chat", download: "⬇️ Downloader",
+  groups: "🛡️ My Groups", anon: "💬 Anonymous Chat",
+};
+
+const TEKS_BAN =
+  "Your access to WesioBot has been suspended by the admin. If you " +
+  "believe this is a mistake, please contact the admin.";
 
 const DL_FORMAT_MARKUP = {
   inline_keyboard: [[
@@ -223,14 +268,55 @@ async function sisaDl(io, uid, prem) {
   return Math.max(0, batasDl(prem) - (await kuotaTerpakai(io, uid, "dl")));
 }
 
+// ---- user API key (BYOK): {provider, base, key} in KV apikey:<uid> ----
+async function muatKunci(io, uid) {
+  try {
+    const v = await io.kvGet("apikey:" + uid);
+    if (!v) return null;
+    const r = JSON.parse(v);
+    return r && r.key && r.base ? r : null;
+  } catch (e) { return null; }
+}
+
+// ---- module switches: KV config:modules = {ai, download, groups, anon}
+async function modulConfig(io) {
+  const cfg = { ai: true, download: true, groups: true, anon: true };
+  try {
+    const v = await io.kvGet("config:modules");
+    if (v) Object.assign(cfg, JSON.parse(v));
+  } catch (e) { /* a broken config must never take the bot down */ }
+  return cfg;
+}
+
+async function modulAktif(io, nama) {
+  return !!(await modulConfig(io))[nama];
+}
+
+async function pesanModulOff(io, chatId, nama) {
+  await io.send(chatId,
+    `⏸️ ${MODULE_LABELS[nama]} is temporarily off right now.\n\n` +
+    "Please try one of my other tools meanwhile — tap a button below.",
+    MENU_MARKUP);
+}
+
+// ---- bans: KV ban:<uid> ----
+async function terban(io, uid) {
+  return !!(await io.kvGet("ban:" + uid));
+}
+
 // ---------------- Module: AI ----------------
 function aiSiap(io) {
   return !!(io.ai && io.ai.apiKey && io.ai.baseUrl && io.ai.modelFast);
 }
 
 async function mulaiAi(io, chatId, uid) {
-  if (!aiSiap(io)) {
-    await io.send(chatId, TEKS_AI_OFF, MENU_MARKUP);
+  if (!(await modulAktif(io, "ai"))) {
+    await pesanModulOff(io, chatId, "ai");
+    return;
+  }
+  const kunci = await muatKunci(io, uid);
+  if (!aiSiap(io) && !kunci) {
+    await io.send(chatId, TEKS_AI_OFF, BYOK_OFFER_MARKUP);
     return;
   }
   const c = await muatConv(io, uid);
@@ -241,20 +327,29 @@ async function mulaiAi(io, chatId, uid) {
   await simpanConv(io, uid, c);
   const prem = await premiumAktif(io, uid);
   const sisa = await sisaAi(io, uid, prem);
+  const barisKuota = kunci
+    ? `🔑 Your own ${(BYOK_PROVIDERS[kunci.provider] || {}).name || "provider"} ` +
+      "API key is active — no daily quota applies to you."
+    : `Model: ${c.aiModel === "strong" ? "🧠 Strong" : "⚡ Fast"}\n` +
+      `AI messages left today: ${sisa} of ${batasAi(prem)}`;
   await io.send(chatId,
     "🤖 AI Chat\n\n" +
     "Ask me anything, or pick a quick task below.\n" +
     "Example: tap 📝 Summarize, then paste a long text — I'll shrink it " +
     "for you.\n\n" +
-    `Model: ${c.aiModel === "strong" ? "🧠 Strong" : "⚡ Fast"}\n` +
-    `AI messages left today: ${sisa} of ${batasAi(prem)}\n\n` +
+    barisKuota + "\n\n" +
     "Just type your message to chat.",
     AI_KEYBOARD);
 }
 
 async function prosesAi(io, chatId, uid, teks) {
-  if (!aiSiap(io)) {
-    await io.send(chatId, TEKS_AI_OFF, MENU_MARKUP);
+  if (!(await modulAktif(io, "ai"))) {
+    await pesanModulOff(io, chatId, "ai");
+    return;
+  }
+  const kunci = await muatKunci(io, uid);
+  if (!aiSiap(io) && !kunci) {
+    await io.send(chatId, TEKS_AI_OFF, BYOK_OFFER_MARKUP);
     return;
   }
   const prem = await premiumAktif(io, uid);
@@ -300,7 +395,7 @@ async function prosesAi(io, chatId, uid, teks) {
   }
 
   const sisa = await sisaAi(io, uid, prem);
-  if (sisa <= 0) {
+  if (!kunci && sisa <= 0) {
     await io.send(chatId,
       `You've used all ${batasAi(prem)} AI messages for today. Your ` +
       "quota resets tomorrow at 00:00 UTC.\n\n" +
@@ -342,12 +437,29 @@ async function prosesAi(io, chatId, uid, teks) {
     ]);
   }
 
-  const model = c.aiModel === "strong" && prem && io.ai.modelStrong
-    ? io.ai.modelStrong : io.ai.modelFast;
+  // With the user's own key: their provider's default model, their
+  // credentials, and no Wesio quota. Otherwise the system key + quota.
+  const provKunci = kunci ? BYOK_PROVIDERS[kunci.provider] : null;
+  const model = kunci
+    ? (provKunci ? provKunci.model : io.ai.modelFast)
+    : (c.aiModel === "strong" && prem && io.ai.modelStrong
+      ? io.ai.modelStrong : io.ai.modelFast);
   let jawaban;
   try {
-    jawaban = await io.callAI(messages, model);
+    jawaban = await io.callAI(messages, model,
+      kunci ? { base: kunci.base, key: kunci.key } : null);
   } catch (e) {
+    if (kunci && e && [401, 403, 429].includes(e.status)) {
+      const namaProv = provKunci ? provKunci.name : "Your provider";
+      await io.send(chatId,
+        `${namaProv} answered with an error for your own API key ` +
+        "(it may be out of credit, over its limit, or no longer valid). " +
+        "That's a reply from your provider, not from Wesio.\n\n" +
+        "You can remove your key below and return to the Wesio system " +
+        "key, or send me a different key via 🔑 My API Key.",
+        BYOK_REMOVE_MARKUP);
+      return;
+    }
     await io.send(chatId,
       "The AI is busy right now. Please try again in a moment.",
       AI_KEYBOARD);
@@ -359,20 +471,133 @@ async function prosesAi(io, chatId, uid, teks) {
       "different way.", AI_KEYBOARD);
     return;
   }
-  const terpakai = await kuotaTambah(io, uid, "ai");
   await statTambah(io, "ai");
   if (riwayatBaru) {
     c.history = riwayatBaru.concat([{ role: "assistant", content: potong(jawaban, 4000) }]).slice(-20);
     await simpanConv(io, uid, c);
   }
+  if (kunci) {
+    await io.send(chatId,
+      `${jawaban}\n\n—\n🔑 Using your own API key — no Wesio quota used`,
+      AI_KEYBOARD);
+    return;
+  }
+  const terpakai = await kuotaTambah(io, uid, "ai");
   const sisaNow = Math.max(0, batasAi(prem) - terpakai);
   await io.send(chatId,
     `${jawaban}\n\n—\nAI messages left today: ${sisaNow} of ${batasAi(prem)}`,
     AI_KEYBOARD);
 }
 
+// ---------------- BYOK panel & key intake ----------------
+async function tampilByok(io, chatId, uid) {
+  const kunci = await muatKunci(io, uid);
+  if (kunci) {
+    const prov = BYOK_PROVIDERS[kunci.provider];
+    await io.send(chatId,
+      "🔑 My API Key\n\n" +
+      `Status: active — your own ${prov ? prov.name : "provider"} key is ` +
+      "in use for AI Chat, so the Wesio daily quota does not apply to " +
+      "you.\n\n" +
+      "Your key value is never shown here or anywhere else. You can " +
+      "remove it at any time, or replace it by picking a provider below.",
+      { inline_keyboard: [
+        [{ text: "🗑 Remove my key", callback_data: "byok:remove" }],
+        ...BYOK_PROVIDER_BUTTONS,
+      ] });
+    return;
+  }
+  await io.send(chatId,
+    "🔑 My API Key\n\n" +
+    "Status: no key saved — AI Chat currently runs on the Wesio system " +
+    "key with a daily quota.\n\n" +
+    "Want unlimited use on your own account? Add your own API key: " +
+    "your chats then run on your key and never touch the Wesio quota. " +
+    "The key is tested with your provider before it is saved, and it " +
+    "is never displayed anywhere.\n\n" +
+    "Pick your provider to begin:",
+    { inline_keyboard: BYOK_PROVIDER_BUTTONS });
+}
+
+async function mulaiPasangKunci(io, chatId, uid, kodeProvider) {
+  const prov = BYOK_PROVIDERS[kodeProvider];
+  if (!prov) return;
+  const c = await muatConv(io, uid);
+  c.mode = "ai_await_key";
+  c.byokProvider = kodeProvider;
+  await simpanConv(io, uid, c);
+  await io.send(chatId,
+    `🔑 ${prov.name} key\n\n` +
+    "Send me your API key as a single message. I will test it with " +
+    `${prov.name} first — it is only saved if the test passes.\n\n` +
+    "Tip: after the key is saved, you can delete that message from " +
+    "this chat. It is never stored in your conversation history here, " +
+    "and it never appears in any reply.\n\n" +
+    "Changed your mind? Just tap 🤖 AI Chat below instead.");
+}
+
+async function prosesKunciByok(io, chatId, uid, teks) {
+  const c = await muatConv(io, uid);
+  const kode = c.byokProvider || "openai";
+  const prov = BYOK_PROVIDERS[kode] || BYOK_PROVIDERS.openai;
+  const kandidat = (teks || "").trim();
+  let hasil = null;
+  try { hasil = await io.testApiKey(prov.base, kandidat); }
+  catch (e) { hasil = { ok: false, reason: "unreachable" }; }
+  if (!hasil || !hasil.ok) {
+    // Stay in awaiting mode so the user can simply send another key.
+    if (hasil && hasil.reason === "rejected") {
+      await io.send(chatId,
+        `❌ ${prov.name} rejected that key, so nothing was saved.\n\n` +
+        "Please check the key and send it again — or tap 🤖 AI Chat " +
+        "below to cancel and keep using the Wesio system key.");
+    } else {
+      await io.send(chatId,
+        `❌ I couldn't reach ${prov.name} to check that key, so nothing ` +
+        "was saved.\n\n" +
+        "Please try sending the key again in a moment — or tap " +
+        "🤖 AI Chat below to cancel.");
+    }
+    return;
+  }
+  await io.kvPut("apikey:" + uid, JSON.stringify({
+    provider: kode, base: prov.base, key: kandidat,
+  }));
+  c.mode = "ai";
+  c.byokProvider = null;
+  await simpanConv(io, uid, c);
+  await io.send(chatId,
+    `✅ Your ${prov.name} key passed the test and is now active.\n\n` +
+    `Model used with your key: ${prov.model}\n` +
+    "Your AI chats now run on your own key — no Wesio quota is used. " +
+    "Manage it anytime via 🔑 My API Key.",
+    AI_KEYBOARD);
+}
+
+async function hapusKunci(io, chatId, uid) {
+  const kunci = await muatKunci(io, uid);
+  if (!kunci) {
+    await io.send(chatId,
+      "You don't have a saved API key right now — AI Chat is using the " +
+      "Wesio system key.", AI_KEYBOARD);
+    return;
+  }
+  await io.kvDel("apikey:" + uid);
+  const c = await muatConv(io, uid);
+  if (c.mode === "ai_await_key") { c.mode = "ai"; c.byokProvider = null; }
+  await simpanConv(io, uid, c);
+  await io.send(chatId,
+    "🗑 Your API key has been removed.\n\n" +
+    "AI Chat now uses the Wesio system key again, with the normal " +
+    "daily quota.", AI_KEYBOARD);
+}
+
 // ---------------- Module: Downloader ----------------
 async function mulaiDownload(io, chatId, uid) {
+  if (!(await modulAktif(io, "download"))) {
+    await pesanModulOff(io, chatId, "download");
+    return;
+  }
   const c = await muatConv(io, uid);
   c.mode = "dl_wait_link";
   c.pendingUrl = null;
@@ -389,6 +614,10 @@ async function mulaiDownload(io, chatId, uid) {
 }
 
 async function terimaTautan(io, chatId, uid, teks) {
+  if (!(await modulAktif(io, "download"))) {
+    await pesanModulOff(io, chatId, "download");
+    return;
+  }
   const url = cariTautan(teks);
   if (!url || !tautanDidukung(url)) {
     await io.send(chatId,
@@ -415,6 +644,10 @@ async function terimaTautan(io, chatId, uid, teks) {
 }
 
 async function jalankanDownload(io, chatId, uid, format) {
+  if (!(await modulAktif(io, "download"))) {
+    await pesanModulOff(io, chatId, "download");
+    return;
+  }
   const c = await muatConv(io, uid);
   const url = c.pendingUrl;
   c.mode = "idle";
@@ -533,13 +766,18 @@ async function tanganiPembayaran(io, msg) {
   }
 }
 
-// ---------------- Admin report ----------------
+// ---------------- Admin ----------------
+function adalahAdmin(io, uid) {
+  return String(uid) === String(io.adminId);
+}
+
+async function tolakBukanAdmin(io, chatId) {
+  await io.send(chatId,
+    "That command is only available to the bot's admin.", MENU_MARKUP);
+}
+
 async function adminStats(io, chatId, uid) {
-  if (String(uid) !== String(io.adminId)) {
-    await io.send(chatId,
-      "That command is only available to the bot's admin.", MENU_MARKUP);
-    return;
-  }
+  if (!adalahAdmin(io, uid)) { await tolakBukanAdmin(io, chatId); return; }
   const users = await io.kvList("user:");
   const premKeys = await io.kvList("premium:");
   let premAktifN = 0;
@@ -547,6 +785,10 @@ async function adminStats(io, chatId, uid) {
     const id = k.slice("premium:".length);
     if (await premiumAktif(io, id)) premAktifN++;
   }
+  const bans = await io.kvList("ban:");
+  const cfg = await modulConfig(io);
+  const statModul = MODULE_NAMES
+    .map(m => `${MODULE_LABELS[m]} ${cfg[m] ? "on" : "OFF"}`).join(" · ");
   const aiHariIni = await io.kvGet(`stats:${hariIniUTC()}:ai`);
   const dlHariIni = await io.kvGet(`stats:${hariIniUTC()}:dl`);
   await io.send(chatId,
@@ -554,8 +796,64 @@ async function adminStats(io, chatId, uid) {
     `Registered users: ${users.length}\n` +
     `AI messages today: ${aiHariIni || 0}\n` +
     `Downloads started today: ${dlHariIni || 0}\n` +
-    `Premium active: ${premAktifN}`,
+    `Premium active: ${premAktifN}\n` +
+    `Banned users: ${bans.length}\n` +
+    `Modules: ${statModul}`,
     MENU_MARKUP);
+}
+
+async function tampilAdminModules(io, chatId, uid) {
+  if (!adalahAdmin(io, uid)) { await tolakBukanAdmin(io, chatId); return; }
+  const cfg = await modulConfig(io);
+  const rows = MODULE_NAMES.map(m => [{
+    text: `${MODULE_LABELS[m]}: ${cfg[m] ? "✅ ON" : "⏸ OFF"}`,
+    callback_data: "admin:mod:" + m,
+  }]);
+  await io.send(chatId,
+    "🛠️ Module switches\n\n" +
+    "Tap a module to switch it on or off. While a module is off, users " +
+    "get a friendly note and no quota is used. Group Moderation and " +
+    "Anonymous Chat still answer 'coming soon' while they are on — " +
+    "their phases are not built yet.",
+    { inline_keyboard: rows });
+}
+
+async function adminBan(io, chatId, uid, target) {
+  if (!adalahAdmin(io, uid)) { await tolakBukanAdmin(io, chatId); return; }
+  if (!/^\d+$/.test(target || "")) {
+    await io.send(chatId,
+      "Usage: /admin_ban <telegram-user-id> — the id must be a number.",
+      MENU_MARKUP);
+    return;
+  }
+  if (String(target) === String(io.adminId)) {
+    await io.send(chatId,
+      "That id belongs to the admin account — the admin cannot be " +
+      "banned.", MENU_MARKUP);
+    return;
+  }
+  await io.kvPut("ban:" + target,
+    JSON.stringify({ at: new Date().toISOString() }));
+  await io.send(chatId,
+    `🚫 User ${target} is now banned. Every module will refuse them ` +
+    "until you lift it with /admin_unban " + target + ".", MENU_MARKUP);
+}
+
+async function adminUnban(io, chatId, uid, target) {
+  if (!adalahAdmin(io, uid)) { await tolakBukanAdmin(io, chatId); return; }
+  if (!/^\d+$/.test(target || "")) {
+    await io.send(chatId,
+      "Usage: /admin_unban <telegram-user-id> — the id must be a number.",
+      MENU_MARKUP);
+    return;
+  }
+  if (!(await io.kvGet("ban:" + target))) {
+    await io.send(chatId, `User ${target} is not banned.`, MENU_MARKUP);
+    return;
+  }
+  await io.kvDel("ban:" + target);
+  await io.send(chatId,
+    `✅ User ${target} is no longer banned.`, MENU_MARKUP);
 }
 
 // ---------------- Callback queries (inline buttons) ----------------
@@ -566,10 +864,33 @@ async function handleCallback(io, cq) {
   await catatPengguna(io, uid);
   const data = cq.data || "";
   await io.answerCallback(cq.id);
+  if (!adalahAdmin(io, uid) && (await terban(io, uid))) {
+    await io.send(chatId, TEKS_BAN, MENU_MARKUP);
+    return;
+  }
   const c = await muatConv(io, uid);
 
   if (data === "nav:premium") { await tampilPremium(io, chatId, uid); return; }
   if (data === "buy:premium") { await beliPremium(io, chatId, uid); return; }
+
+  if (data === "byok:open") { await tampilByok(io, chatId, uid); return; }
+  if (data === "byok:remove") { await hapusKunci(io, chatId, uid); return; }
+  if (data.startsWith("byok:provider:")) {
+    await mulaiPasangKunci(io, chatId, uid, data.slice("byok:provider:".length));
+    return;
+  }
+
+  if (data.startsWith("admin:mod:")) {
+    const nama = data.slice("admin:mod:".length);
+    if (!adalahAdmin(io, uid)) { await tolakBukanAdmin(io, chatId); return; }
+    if (MODULE_NAMES.includes(nama)) {
+      const cfg = await modulConfig(io);
+      cfg[nama] = !cfg[nama];
+      await io.kvPut("config:modules", JSON.stringify(cfg));
+    }
+    await tampilAdminModules(io, chatId, uid);
+    return;
+  }
 
   if (data === "dl:video" || data === "dl:audio") {
     await jalankanDownload(io, chatId, uid, data === "dl:video" ? "video" : "audio");
@@ -577,7 +898,14 @@ async function handleCallback(io, cq) {
   }
 
   if (data.startsWith("ai:")) {
-    if (!aiSiap(io)) { await io.send(chatId, TEKS_AI_OFF, MENU_MARKUP); return; }
+    if (!(await modulAktif(io, "ai"))) {
+      await pesanModulOff(io, chatId, "ai");
+      return;
+    }
+    if (!aiSiap(io) && !(await muatKunci(io, uid))) {
+      await io.send(chatId, TEKS_AI_OFF, BYOK_OFFER_MARKUP);
+      return;
+    }
     const prem = await premiumAktif(io, uid);
     if (data === "ai:model:fast" || data === "ai:model:strong") {
       if (data === "ai:model:strong" && !prem) {
@@ -645,6 +973,15 @@ export async function handleUpdate(io, update) {
     return;
   }
 
+  // Banned users are refused by every module (the admin is exempt —
+  // the admin account can never be banned in the first place).
+  if (!adalahAdmin(io, uid) && (await terban(io, uid))) {
+    if ((msg.text || "").trim()) {
+      await io.send(chatId, TEKS_BAN, MENU_MARKUP);
+    }
+    return;
+  }
+
   const text = (msg.text || "").trim();
   if (!text) return;
   const rendah = text.toLowerCase();
@@ -665,6 +1002,15 @@ export async function handleUpdate(io, update) {
     return;
   }
   if (perintah === "/admin_stats") { await adminStats(io, chatId, uid); return; }
+  if (perintah === "/admin_modules") { await tampilAdminModules(io, chatId, uid); return; }
+  if (perintah === "/admin_ban" || perintah.startsWith("/admin_ban ")) {
+    await adminBan(io, chatId, uid, perintah.slice("/admin_ban".length).trim());
+    return;
+  }
+  if (perintah === "/admin_unban" || perintah.startsWith("/admin_unban ")) {
+    await adminUnban(io, chatId, uid, perintah.slice("/admin_unban".length).trim());
+    return;
+  }
   if (perintah === "/premium" || text === "⭐ Premium") {
     await tampilPremium(io, chatId, uid);
     return;
@@ -678,10 +1024,18 @@ export async function handleUpdate(io, update) {
     return;
   }
   if (text === "🛡️ My Groups") {
+    if (!(await modulAktif(io, "groups"))) {
+      await pesanModulOff(io, chatId, "groups");
+      return;
+    }
     await io.send(chatId, TEKS_GROUPS_SOON, MENU_MARKUP);
     return;
   }
   if (text === "💬 Anonymous Chat") {
+    if (!(await modulAktif(io, "anon"))) {
+      await pesanModulOff(io, chatId, "anon");
+      return;
+    }
     await io.send(chatId, TEKS_ANON_SOON, MENU_MARKUP);
     return;
   }
@@ -690,6 +1044,12 @@ export async function handleUpdate(io, update) {
   if (grup) return;
 
   const c = await muatConv(io, uid);
+  // A message sent while installing a BYOK key IS the key: it is tested
+  // and stored only as the key record — never written to chat history.
+  if (c.mode === "ai_await_key") {
+    await prosesKunciByok(io, chatId, uid, text);
+    return;
+  }
   // A pasted supported link works from anywhere.
   if (cariTautan(text) && tautanDidukung(cariTautan(text))) {
     if (c.mode === "ai" && c.aiTask === "summarize") {
@@ -785,21 +1145,49 @@ function buatIo(env) {
       });
       return { url: r.url, status: r.status, text: await r.text() };
     },
-    callAI: async (messages, model) => {
-      const r = await fetch(aiBase + "/chat/completions", {
+    // creds (BYOK) overrides the system base+key; the key value is only
+    // ever placed in the Authorization header — never logged or echoed.
+    // Failures carry .status so the caller can tell a provider's answer
+    // about the user's own key apart from a generic outage.
+    callAI: async (messages, model, creds) => {
+      const base = creds && creds.base
+        ? creds.base.replace(/\/+$/, "") : aiBase;
+      const key = creds && creds.key ? creds.key : env.AI_API_KEY;
+      const r = await fetch(base + "/chat/completions", {
         method: "POST",
         headers: {
-          "Authorization": "Bearer " + env.AI_API_KEY,
+          "Authorization": "Bearer " + key,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ model, messages }),
       });
-      if (!r.ok) throw new Error("AI HTTP " + r.status);
+      if (!r.ok) {
+        const err = new Error("AI HTTP " + r.status);
+        err.status = r.status;
+        throw err;
+      }
       const data = await r.json();
       const choice = data.choices && data.choices[0];
       const content = choice && choice.message && choice.message.content;
       if (!content) throw new Error("AI empty answer");
       return content;
+    },
+    // Light key check used before a BYOK key is saved: GET /models.
+    testApiKey: async (base, key) => {
+      let r;
+      try {
+        r = await fetch(base.replace(/\/+$/, "") + "/models", {
+          method: "GET",
+          headers: { "Authorization": "Bearer " + key },
+        });
+      } catch (e) {
+        return { ok: false, reason: "unreachable" };
+      }
+      if (r.ok) return { ok: true };
+      if (r.status === 401 || r.status === 403) {
+        return { ok: false, reason: "rejected" };
+      }
+      return { ok: false, reason: "unreachable" };
     },
     genImage: async (prompt) => {
       const r = await fetch(aiBase + "/images/generations", {
