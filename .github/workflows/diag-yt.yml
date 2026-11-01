@@ -1,0 +1,57 @@
+name: diag-yt
+on: workflow_dispatch
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Jalur alternatif Invidious untuk Shorts sehat
+        shell: bash
+        run: |
+          set +e
+          ID="BCaCmDrc_mM"
+          for inst in inv.nadeko.net invidious.nerdvpn.de yewtu.be invidious.perennialte.ch invidious.privacyredirect.com; do
+            echo "=== $inst"
+            timeout 30 curl -s "https://$inst/api/v1/videos/$ID" -o /tmp/v.json -w "http=%{http_code} bytes=%{size_download}\n"
+            python3 - <<PY
+          import json
+          try:
+              d = json.load(open('/tmp/v.json'))
+              fmts = d.get('adaptiveFormats') or []
+              streams = d.get('formatStreams') or []
+              print('judul:', (d.get('title') or '')[:60])
+              print('adaptiveFormats:', len(fmts), '| formatStreams:', len(streams))
+              cand = [f for f in fmts if 'video' in (f.get('type') or '')] or streams
+              if cand:
+                  print('URL_FORMAT:', cand[0].get('url','')[:400])
+          except Exception as e:
+              print('bukan JSON valid:', e)
+          PY
+          done
+      - name: Unduh berkas dari URL Invidious pertama yang hidup
+        shell: bash
+        run: |
+          set +e
+          ID="BCaCmDrc_mM"
+          for inst in inv.nadeko.net invidious.nerdvpn.de yewtu.be invidious.perennialte.ch invidious.privacyredirect.com; do
+            timeout 30 curl -s "https://$inst/api/v1/videos/$ID" -o /tmp/v.json
+            URL=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/v.json'))
+          fmts = [f for f in (d.get('adaptiveFormats') or []) if 'video' in (f.get('type') or '') and (f.get('height') or 9999) <= 720]
+          fmts.sort(key=lambda f: -(f.get('height') or 0))
+          print((fmts[0].get('url') if fmts else '') or '')
+          " 2>/dev/null)
+            if [ -n "$URL" ]; then
+              echo "mencoba unduh dari $inst"
+              timeout 60 curl -sL "$URL" -o /tmp/vid.bin -w "http=%{http_code} bytes=%{size_download} tipe=%{content_type}\n"
+              file /tmp/vid.bin || true
+              break
+            fi
+          done
+      - name: Probe cobalt API publik
+        shell: bash
+        run: |
+          set +e
+          timeout 30 curl -s -X POST "https://api.cobalt.tools/" -H "Accept: application/json" -H "Content-Type: application/json" -d '{"url":"https://www.youtube.com/shorts/BCaCmDrc_mM","videoQuality":"720"}' -w "\nhttp=%{http_code}\n" | head -c 600
