@@ -42,6 +42,16 @@ function buatIo(opts = {}) {
     callAI: async (messages, model, creds) => {
       aiCalls.push({ messages, model,
         base: creds ? creds.base : null, key: creds ? creds.key : null });
+      // opts.aiFailFor(model) -> status HTTP untuk model itu saja,
+      // untuk menguji rantai model (lompat saat 429/404/503).
+      if (opts.aiFailFor) {
+        const st = opts.aiFailFor(model, creds);
+        if (st) {
+          const e = new Error("AI HTTP " + st);
+          e.status = st;
+          throw e;
+        }
+      }
       if (creds && opts.byokFailStatus) {
         const e = new Error("AI HTTP " + opts.byokFailStatus);
         e.status = opts.byokFailStatus;
@@ -481,18 +491,22 @@ console.log("16) BYOK auto-detect: tempel kunci -> provider ketemu sendiri; mode
       terakhir(W).text.includes("detected it as a Google Gemini key"),
       terakhir(W).text.slice(0, 250));
   const recG = JSON.parse(W.kv.get("apikey:16001") || "{}");
-  cek("AIza…: record {provider gemini, base gemini, model gemini-2.0-flash}",
+  cek("AIza…: record menyimpan rantai cadangan Gemini + model aktif",
       recG.provider === "gemini" && recG.base.includes("googleapis") &&
-      recG.model === "gemini-2.0-flash" && recG.key === "AIzaSy-gratis-123",
-      JSON.stringify({ p: recG.provider, m: recG.model }));
-  cek("AIza…: konfirmasi menyebut model + tingkat gratis Gemini",
-      terakhir(W).text.includes("gemini-2.0-flash") &&
-      terakhir(W).text.includes("free tier"), terakhir(W).text.slice(0, 300));
+      JSON.stringify(recG.models) ===
+        JSON.stringify(["gemini-2.5-flash", "gemini-2.0-flash"]) &&
+      recG.active === "gemini-2.5-flash" && recG.key === "AIzaSy-gratis-123",
+      JSON.stringify({ p: recG.provider, m: recG.models, a: recG.active }));
+  cek("AIza…: konfirmasi menyebut model + tingkat gratis + cadangan otomatis",
+      terakhir(W).text.includes("gemini-2.5-flash") &&
+      terakhir(W).text.includes("free tier") &&
+      terakhir(W).text.includes("switch to the next one automatically"),
+      terakhir(W).text.slice(0, 400));
   await handleUpdate(W.io, msg(16001, "🤖 AI Chat"));
   await handleUpdate(W.io, msg(16001, "halo"));
   const callG = W.aiCalls[W.aiCalls.length - 1];
-  cek("AIza…: chat jalan memakai model tersimpan, tanpa potong kuota",
-      !!callG && callG.model === "gemini-2.0-flash" &&
+  cek("AIza…: chat jalan memakai model aktif tersimpan, tanpa potong kuota",
+      !!callG && callG.model === "gemini-2.5-flash" &&
       callG.key === "AIzaSy-gratis-123" &&
       !W.kv.has(`quota:16001:ai:${hariIniUTC()}`),
       JSON.stringify(callG && { m: callG.model }));
@@ -512,12 +526,17 @@ console.log("16) BYOK auto-detect: tempel kunci -> provider ketemu sendiri; mode
       recO.provider === "openrouter" &&
       Wo.keyTests[0].base.includes("openrouter"),
       JSON.stringify({ p: recO.provider, t: Wo.keyTests.map(k => k.base) }));
-  cek("sk-or-…: model ':free' PERTAMA dari daftar provider yang disimpan",
-      recO.model === "meta-llama/llama-3.1-8b:free", recO.model || "kosong");
-  cek("sk-or-…: konfirmasi menyebut 'free model' + nama modelnya",
+  cek("sk-or-…: rantai = semua ':free' (urutan provider) + ekor default",
+      JSON.stringify(recO.models) === JSON.stringify([
+        "meta-llama/llama-3.1-8b:free", "google/gemma-2-9b:free",
+        "openai/gpt-4o-mini"]) &&
+      recO.active === "meta-llama/llama-3.1-8b:free",
+      JSON.stringify(recO.models));
+  cek("sk-or-…: konfirmasi menyebut 'free model' + nama modelnya + cadangan otomatis",
       terakhir(Wo).text.includes("free model") &&
-      terakhir(Wo).text.includes("meta-llama/llama-3.1-8b:free"),
-      terakhir(Wo).text.slice(0, 300));
+      terakhir(Wo).text.includes("meta-llama/llama-3.1-8b:free") &&
+      terakhir(Wo).text.includes("switch to the next one automatically"),
+      terakhir(Wo).text.slice(0, 400));
   await handleUpdate(Wo.io, msg(16002, "🤖 AI Chat"));
   await handleUpdate(Wo.io, msg(16002, "halo"));
   const callO = Wo.aiCalls[Wo.aiCalls.length - 1];
@@ -534,9 +553,10 @@ console.log("16) BYOK auto-detect: tempel kunci -> provider ketemu sendiri; mode
   await handleUpdate(Wo2.io, cb(16003, "byok:paste"));
   await handleUpdate(Wo2.io, msg(16003, "sk-or-v1-bayar"));
   const recO2 = JSON.parse(Wo2.kv.get("apikey:16003") || "{}");
-  cek("sk-or-… tanpa ':free': model default OpenRouter disimpan, tanpa klaim gratis",
-      recO2.model === "openai/gpt-4o-mini" &&
-      !terakhir(Wo2).text.includes("free model"), recO2.model || "kosong");
+  cek("sk-or-… tanpa ':free': rantai hanya ekor default, tanpa klaim gratis",
+      JSON.stringify(recO2.models) === JSON.stringify(["openai/gpt-4o-mini"]) &&
+      !terakhir(Wo2).text.includes("free model"),
+      JSON.stringify(recO2.models));
 
   // (d) Kunci "sk-…" yang hanya diterima OpenAI -> OpenAI; bila OpenAI
   // menolak, urutan lanjut ke OpenRouter.
@@ -550,6 +570,9 @@ console.log("16) BYOK auto-detect: tempel kunci -> provider ketemu sendiri; mode
       recD.provider === "openai" &&
       Wd.keyTests.length === 1 && Wd.keyTests[0].base.includes("api.openai.com"),
       JSON.stringify({ p: recD.provider, t: Wd.keyTests.map(k => k.base) }));
+  cek("sk-… OpenAI: rantai hanya [gpt-4o-mini] (tidak ada gratisan dikarang)",
+      JSON.stringify(recD.models) === JSON.stringify(["gpt-4o-mini"]) &&
+      recD.active === "gpt-4o-mini", JSON.stringify(recD.models));
   cek("sk-… OpenAI: konfirmasi menyebut model + catatan TANPA tingkat gratis",
       terakhir(Wd).text.includes("gpt-4o-mini") &&
       terakhir(Wd).text.includes("no free tier"), terakhir(Wd).text.slice(0, 350));
@@ -625,6 +648,160 @@ console.log("16) BYOK auto-detect: tempel kunci -> provider ketemu sendiri; mode
   cek("402: tanpa angka/teks teknis di pesan pengguna",
       !terakhir(Wh).text.includes("402") &&
       !/http|error/i.test(terakhir(Wh).text), terakhir(Wh).text.slice(0, 200));
+}
+
+console.log("17) Rantai BYOK saat dipakai: 429/404 lompat otomatis, 401 berhenti, semua habis -> pesan manusia");
+{
+  // (a) Model pertama 429 -> jawaban dari model kedua, TANPA pesan
+  // gagal ke pengguna; model aktif tercatat berpindah; pesan berikutnya
+  // mulai dari model yang terakhir berhasil.
+  const W = buatIo({ ai: AI_ON,
+    aiFailFor: (model) => (model === "m/one:free" ? 429 : null) });
+  W.kv.set("apikey:17001", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-rantai",
+    models: ["m/one:free", "m/two:free", "openai/gpt-4o-mini"],
+    active: "m/one:free" }));
+  await handleUpdate(W.io, msg(17001, "/ai"));
+  await handleUpdate(W.io, msg(17001, "halo"));
+  cek("model pertama 429: jawaban tetap datang (dari model kedua)",
+      terakhir(W).text.includes("Mock AI answer.") &&
+      terakhir(W).text.includes("Using your own API key"),
+      terakhir(W).text.slice(0, 200));
+  cek("model pertama 429: urutan panggilan one -> two",
+      W.aiCalls.length === 2 &&
+      W.aiCalls[0].model === "m/one:free" &&
+      W.aiCalls[1].model === "m/two:free",
+      JSON.stringify(W.aiCalls.map(a => a.model)));
+  cek("model pertama 429: TIDAK ada pesan gagal/kuota ke pengguna",
+      !semua(W).includes("out of quota") &&
+      !semua(W).includes("answered with an error"), "");
+  const recA = JSON.parse(W.kv.get("apikey:17001") || "{}");
+  cek("model aktif tercatat berpindah ke model yang berhasil",
+      recA.active === "m/two:free", recA.active || "kosong");
+  await handleUpdate(W.io, msg(17001, "lagi"));
+  cek("pesan berikutnya MULAI dari model terakhir-berhasil (tanpa coba ulang yang 429)",
+      W.aiCalls.length === 3 && W.aiCalls[2].model === "m/two:free",
+      JSON.stringify(W.aiCalls.map(a => a.model)));
+
+  // (b) Semua model 429 -> pesan habis kuota yang manusiawi.
+  const Wb = buatIo({ ai: AI_ON, aiFailFor: () => 429 });
+  Wb.kv.set("apikey:17002", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-habis", models: ["a:free", "b:free"], active: "a:free" }));
+  await handleUpdate(Wb.io, msg(17002, "/ai"));
+  await handleUpdate(Wb.io, msg(17002, "halo"));
+  cek("semua model 429 -> pesan 'out of quota' + 'try again later'",
+      terakhir(Wb).text.includes("out of quota") &&
+      terakhir(Wb).text.includes("try again later"),
+      terakhir(Wb).text.slice(0, 250));
+  cek("semua model 429 -> kedua model dicoba, tanpa jawaban AI",
+      Wb.aiCalls.length === 2 &&
+      !terakhir(Wb).text.includes("Mock AI answer."), "");
+
+  // (c) 401 -> TIDAK lompat model: langsung jalur error kunci lama.
+  const Wc = buatIo({ ai: AI_ON, byokFailStatus: 401 });
+  Wc.kv.set("apikey:17003", JSON.stringify({
+    provider: "openrouter", base: "https://openrouter.ai/api/v1",
+    key: "sk-ditolak", models: ["a:free", "b:free"], active: "a:free" }));
+  await handleUpdate(Wc.io, msg(17003, "/ai"));
+  await handleUpdate(Wc.io, msg(17003, "halo"));
+  cek("401: hanya SATU panggilan (tidak lompat ke model kedua)",
+      Wc.aiCalls.length === 1, String(Wc.aiCalls.length));
+  cek("401: pesan error kunci seperti aturan lama",
+      terakhir(Wc).text.includes("answered with an error for your own API key"),
+      terakhir(Wc).text.slice(0, 200));
+
+  // (d) 404 pada model pertama -> lompat juga (model tak tersedia).
+  const Wd = buatIo({ ai: AI_ON,
+    aiFailFor: (model) => (model === "g-a" ? 404 : null) });
+  Wd.kv.set("apikey:17004", JSON.stringify({
+    provider: "gemini",
+    base: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    key: "AIza-rantai", models: ["g-a", "g-b"], active: "g-a" }));
+  await handleUpdate(Wd.io, msg(17004, "/ai"));
+  await handleUpdate(Wd.io, msg(17004, "halo"));
+  cek("404: lompat ke model berikutnya dan jawaban datang",
+      Wd.aiCalls.length === 2 && Wd.aiCalls[1].model === "g-b" &&
+      terakhir(Wd).text.includes("Mock AI answer."),
+      JSON.stringify(Wd.aiCalls.map(a => a.model)));
+
+  // (e) Panel menampilkan model aktif + jumlah cadangan.
+  await handleUpdate(W.io, cb(17001, "byok:open"));
+  cek("panel: model aktif terakhir-berhasil + 'Backup models ready: 2'",
+      terakhir(W).text.includes("Model in use: m/two:free") &&
+      terakhir(W).text.includes("Backup models ready: 2"),
+      terakhir(W).text.slice(0, 300));
+
+  // (f) Rantai Gemini dari daftar provider: flash terbaru dulu,
+  // non-chat tersaring, maks 4.
+  const Wf = buatIo({ ai: AI_ON, testKey: (base) =>
+    base.includes("googleapis")
+      ? { ok: true, models: ["gemini-2.0-flash", "gemini-2.5-flash",
+          "gemini-2.5-pro", "gemini-embedding-001",
+          "gemini-2.0-flash-lite"] }
+      : { ok: false, reason: "rejected" } });
+  await handleUpdate(Wf.io, cb(17005, "byok:paste"));
+  await handleUpdate(Wf.io, msg(17005, "AIza-daftar-model"));
+  const recF = JSON.parse(Wf.kv.get("apikey:17005") || "{}");
+  cek("rantai Gemini: flash versi terbaru dulu, embedding tersaring, maks 4",
+      JSON.stringify(recF.models) === JSON.stringify([
+        "gemini-2.5-flash", "gemini-2.0-flash",
+        "gemini-2.0-flash-lite", "gemini-2.5-pro"]),
+      JSON.stringify(recF.models));
+
+  // (g) Rantai OpenRouter dibatasi 5 gratisan + ekor.
+  const frees = Array.from({ length: 7 }, (_, i) => `p/m${i + 1}:free`);
+  const Wg = buatIo({ ai: AI_ON, testKey: (base) =>
+    base.includes("openrouter")
+      ? { ok: true, models: frees }
+      : { ok: false, reason: "rejected" } });
+  await handleUpdate(Wg.io, cb(17006, "byok:paste"));
+  await handleUpdate(Wg.io, msg(17006, "sk-or-v1-banyak"));
+  const recG2 = JSON.parse(Wg.kv.get("apikey:17006") || "{}");
+  cek("rantai OpenRouter: maks 5 ':free' + ekor gpt-4o-mini",
+      JSON.stringify(recG2.models) === JSON.stringify(
+        [...frees.slice(0, 5), "openai/gpt-4o-mini"]),
+      JSON.stringify(recG2.models));
+}
+
+console.log("18) Rantai jalur SISTEM: AI_MODEL_FAST daftar koma ditelusuri dengan aturan sama");
+{
+  const AI_CHAIN = { ...AI_ON, modelFast: "fast-a,fast-b" };
+  const W = buatIo({ ai: AI_CHAIN,
+    aiFailFor: (model) => (model === "fast-a" ? 429 : null) });
+  await handleUpdate(W.io, msg(18001, "/ai"));
+  await handleUpdate(W.io, msg(18001, "halo"));
+  cek("FAST 2 model, pertama 429 -> jawaban dari model kedua",
+      W.aiCalls.length === 2 &&
+      W.aiCalls[0].model === "fast-a" &&
+      W.aiCalls[1].model === "fast-b" &&
+      terakhir(W).text.includes("Mock AI answer."),
+      JSON.stringify(W.aiCalls.map(a => a.model)));
+  cek("jalur sistem: kuota tetap terpotong + sisa tampil (14 of 15)",
+      terakhir(W).text.includes("AI messages left today: 14 of 15") &&
+      W.kv.get(`quota:18001:ai:${hariIniUTC()}`) === "1",
+      terakhir(W).text.slice(-200));
+
+  // 401 pada jalur sistem -> berhenti (tidak lompat), pesan umum.
+  const W2 = buatIo({ ai: AI_CHAIN,
+    aiFailFor: (model) => (model === "fast-a" ? 401 : null) });
+  await handleUpdate(W2.io, msg(18002, "/ai"));
+  await handleUpdate(W2.io, msg(18002, "halo"));
+  cek("sistem 401 di model pertama -> TIDAK lompat, pesan sibuk umum",
+      W2.aiCalls.length === 1 &&
+      terakhir(W2).text.includes("busy right now"),
+      JSON.stringify(W2.aiCalls.map(a => a.model)));
+
+  // Semua model sistem 503 -> pesan sibuk umum (bukan pesan BYOK).
+  const W3 = buatIo({ ai: AI_CHAIN, aiFailFor: () => 503 });
+  await handleUpdate(W3.io, msg(18003, "/ai"));
+  await handleUpdate(W3.io, msg(18003, "halo"));
+  cek("sistem semua model gagal rantai -> pesan sibuk umum, kedua model dicoba",
+      W3.aiCalls.length === 2 &&
+      terakhir(W3).text.includes("busy right now") &&
+      !terakhir(W3).text.includes("your key"),
+      terakhir(W3).text.slice(0, 200));
 }
 
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);

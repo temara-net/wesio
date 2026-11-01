@@ -123,9 +123,85 @@ sendiri untuk memakai bebas tanpa kuota sistem).
   (tidak berubah; regresi bersih). `node --check worker/worker.js`
   → OK. Audit nama pribadi di worker/ tests/ → nol temuan.
 
+## Putaran koreksi pemilik (1 Nov 2026 — auto-detect + rantai model)
+
+Dua koreksi pemilik atas tambahan di atas, digabung dengan satu
+tambahan sejalan untuk jalur sistem:
+
+1. **Kunci gratisan harus benar-benar bisa dipakai + provider
+   AUTO-DETECT.** Panel 🔑 My API Key kini menonjolkan satu tindakan
+   utama "📋 Paste my API key": pengguna cukup menempel kunci sebagai
+   pesan, TANPA memilih provider (tombol manual per provider tetap
+   ada di bawahnya sebagai cadangan, alurnya tidak berubah). Saat
+   kunci diterima, urutan uji ditentukan dari petunjuk awalan —
+   "AIza…" Gemini dulu; "sk-or-…" OpenRouter dulu; "sk-…" OpenAI
+   lalu OpenRouter; selain itu Gemini → OpenAI → OpenRouter — dan
+   provider pertama yang menerima (GET /models) adalah pemilik
+   kunci itu. Semua menolak → tidak disimpan + pesan "tidak dikenali
+   provider mana pun" + saran pilih manual; semua tak terjangkau →
+   pesan berbeda (coba lagi nanti), tidak disimpan. `testApiKey`
+   produksi kini juga mengembalikan daftar id model dari /models.
+2. **Rantai model cadangan otomatis (BYOK + sistem).** Record
+   `apikey:<uid>` hasil deteksi kini menyimpan `models: [...]`
+   berurutan + `active` (model terakhir yang berhasil):
+   - Gemini: model chat dari /models berkunci itu, keluarga "flash"
+     versi terbaru dulu, maks 4; daftar kosong → cadangan tetap
+     ["gemini-2.5-flash", "gemini-2.0-flash"].
+   - OpenRouter: semua id ":free" (maks 5, urutan provider) +
+     "openai/gpt-4o-mini" sebagai ekor terakhir.
+   - OpenAI: ["gpt-4o-mini"] saja — tidak ada tingkat gratis, tidak
+     dikarang.
+   Konfirmasi pasang menyebut model pertama (+ kata "free model"
+   bila memang ":free"; catatan tingkat gratis Gemini; catatan
+   OpenAI TANPA tingkat gratis) dan bahwa cadangan otomatis aktif
+   ("if its quota runs out, I'll switch to the next one
+   automatically"). Saat dipakai, panggilan menelusuri rantai mulai
+   dari model terakhir-berhasil (membungkus sekali): kegagalan
+   429/404/503 → lompat ke model berikutnya tanpa pesan gagal ke
+   pengguna; 401/403 TIDAK lompat (masalah kunci, jalur error lama);
+   402 → pesan saran pasang ulang agar deteksi memilih model gratis;
+   semua model gagal rantai → pesan manusia bahwa semua model
+   (termasuk yang gratis) sedang habis kuota, coba lagi nanti.
+   Panel menampilkan model aktif + jumlah model cadangan.
+   Jalur SISTEM ikut memakai rantai yang sama: `AI_MODEL_FAST`
+   boleh berisi daftar model dipisah koma (mis.
+   "gemini-2.5-flash,gemini-2.0-flash"); `AI_MODEL_STRONG` tetap
+   satu model; FAST satu model tanpa koma = perilaku lama persis.
+   Catatan: bullet "Model BYOK = default per provider" pada bagian
+   sebelumnya digantikan oleh mekanisme deteksi + rantai ini untuk
+   pasang via tempel; pasang manual tetap menyimpan model default
+   provider seperti sebelumnya.
+
+## Hasil uji putaran koreksi (dijalankan di mesin ini)
+- `node tests/run_worker_test.mjs` → **128 lulus, 0 gagal**
+  (83 uji lama regresi utuh + 28 uji di bagian 16 (auto-detect;
+  sebagian asersi model disesuaikan ke semantik rantai baru) +
+  13 uji rantai BYOK di bagian 17 + 4 uji rantai sistem di
+  bagian 18 — total 45 uji baru dari basis 83). Cakupan baru:
+  panel menonjolkan Paste + manual tetap ada; "AIza…" terdeteksi
+  Gemini tanpa pilih provider; "sk-or-…" terdeteksi OpenRouter +
+  rantai ":free" + ekor tersimpan; "sk-…" hanya diterima OpenAI →
+  OpenAI (+ catatan tanpa tingkat gratis), ditolak OpenAI → lanjut
+  OpenRouter; ditolak semua → tidak disimpan + urutan uji awalan
+  tak dikenal; semua tak terjangkau → pesan berbeda; rantai Gemini
+  dari daftar provider (flash terbaru dulu, embedding tersaring,
+  maks 4); rantai OpenRouter dibatasi 5 + ekor; model pertama 429
+  → jawaban dari model kedua tanpa pesan gagal + model aktif
+  tercatat berpindah + panggilan berikutnya mulai dari pemenang;
+  404 ikut lompat; semua model 429 → pesan habis kuota; 401 →
+  tidak lompat; kunci kena 402 saat dipakai → saran pasang ulang
+  tanpa teks teknis; panel memuat model aktif + jumlah cadangan;
+  FAST sistem 2 model dengan 429 di pertama → jawaban model kedua
+  + kuota tetap terpotong; sistem 401 → tidak lompat.
+- `python3 tests/run_executor_test.py` → **12 lulus, 0 gagal**
+  (regresi). `node --check worker/worker.js` → OK. Audit nama
+  pribadi di worker/ tests/ → nol temuan.
+
 ## Belum terbukti untuk tambahan ini
 - Tes kunci BYOK terhadap provider ASLI (OpenAI/OpenRouter/Gemini
   nyata) dan panggilan AI BYOK nyata — harness lokal memakai tiruan;
-  perilaku header/endpoint provider asli baru terbukti saat aktivasi.
+  perilaku header/endpoint/bentuk daftar /models provider asli baru
+  terbukti saat aktivasi. Hal yang sama berlaku untuk rantai model
+  (lompat 429 asli) dan daftar FAST sistem berkoma di env produksi.
 - Deploy tambahan ini ke Worker live — di luar lingkup tugas lokal
   ini (belum di-push, belum di-deploy).

@@ -18,13 +18,21 @@
 //
 // AI keys come in two flavours: the system key (env AI_*, daily quota)
 // or the user's own key (BYOK, saved per user in KV apikey:<uid> after a
-// live test against their provider; BYOK chats use the saved model and
-// never consume the system quota). Installing a key needs no provider
-// pick: the user just pastes the key and the provider is auto-detected
-// from it (manual per-provider picking stays available as a fallback).
-// Free keys must work too: Gemini keys land on a free-tier model, and
-// OpenRouter keys are matched to a ":free" model from the provider's
-// own list when one exists.
+// live test against their provider; BYOK chats never consume the system
+// quota). Installing a key needs no provider pick: the user just pastes
+// the key and the provider is auto-detected from it (manual
+// per-provider picking stays available as a fallback). Free keys must
+// work too: Gemini keys land on a free-tier model, and OpenRouter keys
+// are matched to ":free" models from the provider's own list.
+//
+// Both flavours call AI through a MODEL CHAIN: an ordered list of
+// models, tried in turn starting from the last one that worked. When a
+// model answers 429 (quota/rate), 404 or 503 (unavailable), the chain
+// moves to the next model by itself — no user action. 401/403 stop the
+// chain: those mean the key itself is the problem. BYOK chains are
+// built at install time and saved with the key; the system chain comes
+// from AI_MODEL_FAST, which may hold a comma-separated model list
+// (AI_MODEL_STRONG stays a single model).
 //
 // Worker env/secrets: TG_BOT_TOKEN, ADMIN_ID, GH_TOKEN (fine-grained PAT,
 // repo wesio only, Actions read/write), WEBHOOK_SECRET (optional),
@@ -292,8 +300,58 @@ async function sisaDl(io, uid, prem) {
 
 // ---- user API key (BYOK) in KV apikey:<uid> ----
 // Manual installs store {provider, base, key}; auto-detected installs
-// also store the chosen model as {…, model}. Reading code always falls
-// back to the provider default when no model was stored.
+// store {provider, base, key, models: […], active: <model id>} — the
+// ordered fallback chain and the last model that worked. Reading code
+// falls back to the provider default for records without a chain.
+
+// The model chain saved with a user's key (or the single fallback
+// model for older/manual records).
+function rantaiModelKunci(kunci) {
+  if (Array.isArray(kunci.models)) {
+    const rantai = kunci.models.filter(m =>
+      typeof m === "string" && m.trim());
+    if (rantai.length) return rantai;
+  }
+  const prov = BYOK_PROVIDERS[kunci.provider];
+  const tunggal = kunci.model || (prov ? prov.model : "");
+  return tunggal ? [tunggal] : [];
+}
+
+// The system model chain: AI_MODEL_FAST may be a comma-separated list.
+function daftarModelSistem(io) {
+  return String((io.ai && io.ai.modelFast) || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+}
+
+// Statuses that mean "this model cannot serve right now" — quota/rate
+// (429), model gone (404), model unavailable (503). The chain moves on
+// by itself. 401/403 are NOT here: they mean the key is the problem.
+const STATUS_LOMPAT = [429, 404, 503];
+
+// Call the AI through an ordered model chain, starting at position
+// `mulai` and wrapping once through the whole list. Returns
+// {jawaban, model} from the first model that answers. A non-chain
+// failure (401/403/402/…) is rethrown untouched for the caller to
+// handle; when every model fails with a chain status, the thrown
+// error carries .semuaHabis = true.
+async function panggilRantai(io, messages, rantai, creds, mulai = 0) {
+  let statusTerakhir = 0;
+  for (let n = 0; n < rantai.length; n++) {
+    const model = rantai[(mulai + n) % rantai.length];
+    try {
+      const jawaban = await io.callAI(messages, model, creds);
+      return { jawaban, model };
+    } catch (e) {
+      const st = e && e.status;
+      if (STATUS_LOMPAT.includes(st)) { statusTerakhir = st; continue; }
+      throw e;
+    }
+  }
+  const err = new Error("all models in the chain failed");
+  err.status = statusTerakhir || 429;
+  err.semuaHabis = true;
+  throw err;
+}
 async function muatKunci(io, uid) {
   try {
     const v = await io.kvGet("apikey:" + uid);
@@ -462,19 +520,43 @@ async function prosesAi(io, chatId, uid, teks) {
     ]);
   }
 
-  // With the user's own key: the model saved with the key (chosen by
-  // auto-detection, free where the provider offers it), their
-  // credentials, and no Wesio quota. Otherwise the system key + quota.
+  // Both key flavours answer through a model chain (see panggilRantai):
+  // the user's own chain starts at the last model that worked for them
+  // and remembers a new winner; the system chain starts at the first
+  // entry of AI_MODEL_FAST. The strong model stays a single direct call.
   const provKunci = kunci ? BYOK_PROVIDERS[kunci.provider] : null;
-  const model = kunci
-    ? (kunci.model || (provKunci ? provKunci.model : io.ai.modelFast))
-    : (c.aiModel === "strong" && prem && io.ai.modelStrong
-      ? io.ai.modelStrong : io.ai.modelFast);
   let jawaban;
   try {
-    jawaban = await io.callAI(messages, model,
-      kunci ? { base: kunci.base, key: kunci.key } : null);
+    if (kunci) {
+      const rantai = rantaiModelKunci(kunci);
+      const idx = rantai.indexOf(kunci.active);
+      const r = await panggilRantai(io, messages, rantai,
+        { base: kunci.base, key: kunci.key }, idx >= 0 ? idx : 0);
+      jawaban = r.jawaban;
+      if (kunci.active !== r.model) {
+        kunci.active = r.model;
+        await io.kvPut("apikey:" + uid, JSON.stringify(kunci));
+      }
+    } else if (c.aiModel === "strong" && prem && io.ai.modelStrong) {
+      jawaban = await io.callAI(messages, io.ai.modelStrong, null);
+    } else {
+      const r = await panggilRantai(io, messages,
+        daftarModelSistem(io), null, 0);
+      jawaban = r.jawaban;
+    }
   } catch (e) {
+    if (kunci && e && e.semuaHabis) {
+      // Every model the user's key can reach is out of quota or
+      // unavailable right now — say so plainly, with the way back.
+      await io.send(chatId,
+        "⏳ All the models your key can use are out of quota at the " +
+        "moment — the free ones included.\n\n" +
+        "Please try again later; free quotas usually reset daily. " +
+        "Or remove your key below and use the Wesio system key " +
+        "instead.",
+        BYOK_REMOVE_MARKUP);
+      return;
+    }
     if (kunci && e && e.status === 402) {
       // The provider says this key has no credit for that model —
       // the classic free-key-on-a-paid-model case. Re-installing via
@@ -536,13 +618,19 @@ async function tampilByok(io, chatId, uid) {
   const kunci = await muatKunci(io, uid);
   if (kunci) {
     const prov = BYOK_PROVIDERS[kunci.provider];
-    const modelAktif = kunci.model || (prov ? prov.model : "");
+    const rantai = rantaiModelKunci(kunci);
+    const modelAktif = rantai.includes(kunci.active)
+      ? kunci.active : (rantai[0] || "");
     await io.send(chatId,
       "🔑 My API Key\n\n" +
       `Status: active — your own ${prov ? prov.name : "provider"} key is ` +
       "in use for AI Chat, so the Wesio daily quota does not apply to " +
       "you.\n" +
       (modelAktif ? `Model in use: ${modelAktif}\n` : "") +
+      (rantai.length > 1
+        ? `Backup models ready: ${rantai.length - 1} — if the active ` +
+          "one runs out of quota, I switch automatically.\n"
+        : "") +
       "\n" +
       "Your key value is never shown here or anywhere else. You can " +
       "remove it at any time, or replace it — just paste a new key " +
@@ -626,17 +714,40 @@ async function deteksiProvider(io, kandidat) {
   return { gagal: adaDitolak ? "rejected" : "unreachable" };
 }
 
-// Model for an auto-detected key. Free keys must actually work, so
-// OpenRouter keys get the first ":free" model from the provider's own
-// list (falling back to the provider default when there is none).
-function modelDeteksi(kode, models) {
+// The ordered model chain for an auto-detected key. Free keys must
+// actually work, so the chain leads with free capacity:
+// - Gemini: chat models from the provider's own list, newest "flash"
+//   family first, max 4; when the list is empty, a fixed fallback pair.
+// - OpenRouter: every ":free" id from the list (max 5, provider
+//   order), with the provider default as the final tail.
+// - OpenAI: the single default — OpenAI has no free tier, so no
+//   chain is invented for it.
+function daftarModelDeteksi(kode, models) {
   const prov = BYOK_PROVIDERS[kode];
-  if (kode === "openrouter" && Array.isArray(models)) {
-    const gratis = models.find(m =>
-      typeof m === "string" && m.endsWith(":free"));
-    if (gratis) return gratis;
+  const daftar = (Array.isArray(models) ? models : [])
+    .filter(m => typeof m === "string")
+    .map(m => m.replace(/^models\//, ""));
+  if (kode === "gemini") {
+    const chat = daftar.filter(id => {
+      const s = id.toLowerCase();
+      return s.includes("gemini") &&
+        !/(embedding|imagen|image|tts|aqa)/.test(s);
+    });
+    const skor = (id) => {
+      const s = id.toLowerCase();
+      const v = /(\d+)[.](\d+)/.exec(s);
+      const versi = v ? parseFloat(v[1] + "." + v[2]) : 0;
+      return (s.includes("flash") ? 1000 : 0) + versi;
+    };
+    const urut = [...new Set(chat)].sort((a, b) => skor(b) - skor(a));
+    return urut.length ? urut.slice(0, 4)
+      : ["gemini-2.5-flash", "gemini-2.0-flash"];
   }
-  return prov.model;
+  if (kode === "openrouter") {
+    const gratis = daftar.filter(id => id.endsWith(":free")).slice(0, 5);
+    return [...gratis, prov.model];
+  }
+  return [prov.model];
 }
 
 async function prosesKunciByok(io, chatId, uid, teks) {
@@ -666,9 +777,11 @@ async function prosesKunciByok(io, chatId, uid, teks) {
       return;
     }
     const prov = BYOK_PROVIDERS[det.kode];
-    const model = modelDeteksi(det.kode, det.models);
+    const rantai = daftarModelDeteksi(det.kode, det.models);
+    const model = rantai[0];
     await io.kvPut("apikey:" + uid, JSON.stringify({
-      provider: det.kode, base: prov.base, key: kandidat, model,
+      provider: det.kode, base: prov.base, key: kandidat,
+      models: rantai, active: model,
     }));
     c.mode = "ai";
     c.byokProvider = null;
@@ -682,6 +795,11 @@ async function prosesKunciByok(io, chatId, uid, teks) {
     } else if (det.kode === "openai") {
       barisModel += "\nNote: OpenAI has no free tier — usage of this " +
         "key is billed by OpenAI to your own account.";
+    }
+    if (rantai.length > 1) {
+      barisModel += `\nI also lined up ${rantai.length - 1} backup ` +
+        "model(s) for you — if its quota runs out, I'll switch to " +
+        "the next one automatically.";
     }
     await io.send(chatId,
       `✅ Key accepted — I detected it as a ${prov.name} key, and ` +
