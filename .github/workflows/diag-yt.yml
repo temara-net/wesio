@@ -10,15 +10,12 @@ jobs:
         run: pip install -q "yt-dlp>=2024.8.6" curl_cffi
       - name: Probe strategies
         run: |
-          U="https://www.youtube.com/shorts/pnt4wn4lSwQ"
           probe() {
             echo "=== $1"
-            timeout 60 yt-dlp -j --no-warnings $2 "$U" 2>/tmp/err.txt | head -c 200 | grep -o '"title": *"[^"]*"' || true
+            timeout 60 yt-dlp -j --no-warnings $3 "$2" 2>/tmp/err.txt | head -c 200 | grep -o '"title": *"[^"]*"' || true
             tail -2 /tmp/err.txt
           }
-          probe "default" ""
-          probe "android" "--extractor-args youtube:player_client=android"
-          probe "tv" "--extractor-args youtube:player_client=tv"
-          probe "ios" "--extractor-args youtube:player_client=ios"
-          probe "impersonate-chrome" "--impersonate chrome"
-          probe "web_safari+impersonate" "--extractor-args youtube:player_client=web_safari --impersonate safari"
+          probe "kontrol-video-publik-default" "https://www.youtube.com/watch?v=dQw4w9WgXcQ" ""
+          probe "kontrol-video-publik-android" "https://www.youtube.com/watch?v=dQw4w9WgXcQ" "--extractor-args youtube:player_client=android"
+          probe "video-dea-bentuk-watch" "https://www.youtube.com/watch?v=pnt4wn4lSwQ" ""
+          probe "video-dea-shorts-android" "https://www.youtube.com/shorts/pnt4wn4lSwQ" "--extractor-args youtube:player_client=android"
