@@ -1,0 +1,18 @@
+name: diag-yt
+on: workflow_dispatch
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install yt-dlp
+        run: pip install -q "yt-dlp>=2024.8.6"
+      - name: Shorts sehat - perintah produksi persis
+        run: |
+          echo "ffmpeg: $(command -v ffmpeg || echo TIDAK-ADA)"
+          rm -rf /tmp/dl && mkdir -p /tmp/dl
+          timeout 240 python3 -m yt_dlp -f "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" --merge-output-format mp4 --max-filesize 50M --no-playlist --no-warnings -o "/tmp/dl/%(title).80s.%(ext)s" "https://www.youtube.com/shorts/BCaCmDrc_mM" > /tmp/out.txt 2> /tmp/err.txt; echo "rc=$?"
+          echo "--- stdout:"; cat /tmp/out.txt
+          echo "--- stderr:"; cat /tmp/err.txt
+          echo "--- berkas:"; ls -la /tmp/dl/
