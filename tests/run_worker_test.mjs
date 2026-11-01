@@ -28,6 +28,17 @@ function buatIo(opts = {}) {
   const keyTests = [];
   const photos = [];
   const photoBytes = [];
+  // Tiruan API grup (Tahap 2): semua panggilan tercatat.
+  const restricts = [];
+  const deletions = [];
+  const bans = [];
+  const unbans = [];
+  const memberChecks = [];
+  const cbJawaban = [];
+  let msgSeq = 5000;
+  const gagalAksi = () => {
+    if (opts.failActions) throw new Error("Forbidden: not enough rights");
+  };
   const io = {
     adminId: opts.adminId ?? 111,
     ai: opts.ai ?? AI_OFF,
@@ -41,7 +52,38 @@ function buatIo(opts = {}) {
       photoBytes.push({ chatId, base64, mimeType, caption }); },
     sendInvoice: async (chatId, inv) => { invoices.push({ chatId, inv }); },
     answerPreCheckout: async (id, ok, err) => { prechecks.push({ id, ok, err }); },
-    answerCallback: async () => {},
+    answerCallback: async (id, text) => { cbJawaban.push({ id, text }); },
+    // ---- API grup tiruan ----
+    // opts.memberStatus: peta "<gid>:<uid>" -> status Telegram, atau
+    // fungsi (gid, uid) -> status. Bawaan "member".
+    getChatMember: async (chatId, userId) => {
+      memberChecks.push({ chatId, userId });
+      const st = typeof opts.memberStatus === "function"
+        ? opts.memberStatus(chatId, userId)
+        : (opts.memberStatus || {})[`${chatId}:${userId}`] || "member";
+      return { status: st, user: { id: userId } };
+    },
+    restrictMember: async (chatId, userId, permissions, untilDate) => {
+      gagalAksi();
+      restricts.push({ chatId, userId, permissions, untilDate });
+    },
+    deleteMsg: async (chatId, messageId) => {
+      gagalAksi();
+      deletions.push({ chatId, messageId });
+    },
+    banMember: async (chatId, userId) => {
+      gagalAksi();
+      bans.push({ chatId, userId });
+    },
+    unbanMember: async (chatId, userId) => {
+      gagalAksi();
+      unbans.push({ chatId, userId });
+    },
+    sendMsgId: async (chatId, text, markup) => {
+      const id = ++msgSeq;
+      terkirim.push({ chatId, text, markup, msgId: id });
+      return id;
+    },
     fetchText: async (url) => ({ url, status: 200, text: "<html><body>isi artikel</body></html>" }),
     callAI: async (messages, model, creds) => {
       aiCalls.push({ messages, model,
@@ -75,7 +117,9 @@ function buatIo(opts = {}) {
     genImage: opts.genImage ?? (async () => "https://img.invalid/pic.png"),
     dispatch: async (jobId) => { dispatches.push(jobId); },
   };
-  return { io, kv, terkirim, invoices, prechecks, dispatches, aiCalls, keyTests, photos, photoBytes };
+  return { io, kv, terkirim, invoices, prechecks, dispatches, aiCalls,
+    keyTests, photos, photoBytes, restricts, deletions, bans, unbans,
+    memberChecks, cbJawaban };
 }
 
 let seq = 0;
@@ -93,6 +137,32 @@ const paid = (uid, payload) => ({ update_id: ++seq, message: {
 
 const semua = (W) => W.terkirim.map(x => x.text).join("\n");
 const terakhir = (W) => W.terkirim[W.terkirim.length - 1];
+
+// ---- builder update grup (Tahap 2) ----
+const gchat = (gid, title = "Grup Uji") =>
+  ({ id: gid, type: "supergroup", title });
+const gmsg = (gid, uid, text, extra = {}) => ({ update_id: ++seq, message: {
+  message_id: 1000 + seq, chat: gchat(gid),
+  from: { id: uid, first_name: "Tester" }, text, ...extra } });
+const gjoin = (gid, adder, members) => ({ update_id: ++seq, message: {
+  message_id: 1000 + seq, chat: gchat(gid),
+  from: { id: adder, first_name: "Tester" },
+  new_chat_members: members } });
+const botMember = (gid, fromUid, statusLama, statusBaru) => ({
+  update_id: ++seq, my_chat_member: {
+    chat: gchat(gid), from: { id: fromUid, first_name: "Tester" },
+    old_chat_member: { user: { id: 4242, is_bot: true }, status: statusLama },
+    new_chat_member: { user: { id: 4242, is_bot: true }, status: statusBaru } } });
+const chatMemberJoin = (gid, member) => ({ update_id: ++seq, chat_member: {
+  chat: gchat(gid), from: { id: 666, first_name: "Tester" },
+  user: member,
+  old_chat_member: { user: member, status: "left" },
+  new_chat_member: { user: member, status: "member" } } });
+const cbg = (gid, uid, data) => ({ update_id: ++seq, callback_query: {
+  id: "cbg" + seq, from: { id: uid, first_name: "Tester" },
+  message: { chat: gchat(gid), message_id: 55 }, data } });
+const keGrup = (W, gid) => W.terkirim.filter(x => x.chatId === gid);
+const teksGrup = (W, gid) => keGrup(W, gid).map(x => x.text).join("\n");
 
 console.log("1) /start menampilkan menu tombol lengkap (bot publik)");
 {
@@ -247,13 +317,16 @@ console.log("8) Pembayaran dengan payload pengguna lain -> tidak mengaktifkan si
       terakhir(W).text.includes("doesn't match"), terakhir(W).text.slice(0, 150));
 }
 
-console.log("9) Modul Tahap 2/3 menjawab jujur 'coming soon'");
+console.log("9) My Groups = panel sungguhan Tahap 2; Anonymous Chat tetap 'coming soon' jujur");
 {
   const W = buatIo({ ai: AI_ON });
   await handleUpdate(W.io, msg(9001, "🛡️ My Groups"));
-  cek("My Groups -> Phase 2 + ringkasan manfaat",
-      terakhir(W).text.includes("coming in Phase 2") &&
-      terakhir(W).text.includes("anti-spam"), terakhir(W).text.slice(0, 150));
+  cek("My Groups -> panel sungguhan (bukan 'coming soon'): daftar kosong + langkah menambah bot",
+      terakhir(W).text.includes("My Groups") &&
+      terakhir(W).text.includes("don't manage any group") &&
+      terakhir(W).text.includes("Promote me to admin") &&
+      !terakhir(W).text.includes("coming in Phase 2"),
+      terakhir(W).text.slice(0, 150));
   await handleUpdate(W.io, msg(9001, "💬 Anonymous Chat"));
   cek("Anonymous Chat -> Phase 3 + catatan keamanan",
       terakhir(W).text.includes("coming in Phase 3") &&
@@ -1347,6 +1420,393 @@ console.log("22) Downloader terbuka: semua tautan http(s) sah diterima, bukan cu
   const fmt6 = (terakhir(W6).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
   cek("tautan X (platform lama) tetap diterima",
       fmt6.includes("dl:video") && fmt6.includes("dl:audio"), JSON.stringify(fmt6));
+}
+
+console.log("23) Moderasi Grup Tahap 2: siklus grup, panel, captcha, tangga peringatan, kata terlarang, Premium grup");
+{
+  const parseKv = (W, k) => { try { return JSON.parse(W.kv.get(k) || "null"); } catch (e) { return null; } };
+
+  // ---- (a) Siklus hidup: ditambah non-admin -> dipromosi -> panel;
+  // kunci Free; akses pengelola; bot dikeluarkan ----
+  {
+    const GID = -100555;
+    const W = buatIo({ ai: AI_ON, adminId: 111,
+      memberStatus: { "-100555:777": "administrator" } });
+    await handleUpdate(W.io, botMember(GID, 666, "left", "member"));
+    cek("bot ditambah BUKAN admin -> satu pesan sopan minta dipromosi",
+        teksGrup(W, GID).includes("need to be an admin") &&
+        teksGrup(W, GID).includes("Promote me") === false &&
+        teksGrup(W, GID).includes("promote me"),
+        teksGrup(W, GID).slice(0, 200));
+    let rec = parseKv(W, "group:" + GID);
+    cek("grup tercatat (botAdmin=false, pengangkat=666 sebagai pengelola awal)",
+        !!rec && rec.botAdmin === false && rec.addedBy === 666 &&
+        rec.active === true, JSON.stringify(rec));
+    await handleUpdate(W.io, botMember(GID, 666, "member", "administrator"));
+    cek("dipromosi -> pengumuman penjagaan aktif di grup",
+        teksGrup(W, GID).includes("Group protection is ON"), teksGrup(W, GID).slice(-300));
+    rec = parseKv(W, "group:" + GID);
+    cek("record kini botAdmin=true", !!rec && rec.botAdmin === true, "");
+    await handleUpdate(W.io, gjoin(GID, 666, [{ id: 999, first_name: "Newbie" }]));
+    cek("anggota baru di grup Free (captcha mati) -> langsung disambut",
+        teksGrup(W, GID).includes("Welcome, Newbie") &&
+        teksGrup(W, GID).includes("Grup Uji") &&
+        W.restricts.length === 0, teksGrup(W, GID).slice(-300));
+    await handleUpdate(W.io, msg(666, "🛡️ My Groups"));
+    const daftarBtn = (terakhir(W).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+    cek("My Groups pengelola memuat tombol grupnya",
+        daftarBtn.includes("grp:open:" + GID), JSON.stringify(daftarBtn));
+    await handleUpdate(W.io, cb(666, "grp:open:" + GID));
+    cek("panel grup: judul + status Free + status admin bot",
+        terakhir(W).text.includes("Grup Uji") &&
+        terakhir(W).text.includes("Plan: Free") &&
+        terakhir(W).text.includes("admin ✅"), terakhir(W).text.slice(0, 300));
+    const panelBtn = (terakhir(W).markup?.inline_keyboard || []).flat();
+    cek("panel Free: tombol captcha terkunci berlabel Premium + tombol upgrade tampil",
+        panelBtn.some(b => b.text.includes("🔒") && b.text.includes("New-member check")) &&
+        panelBtn.some(b => b.callback_data === "grp:buy:" + GID),
+        JSON.stringify(panelBtn.map(b => b.text)));
+    await handleUpdate(W.io, cb(666, "grp:set:cap:" + GID));
+    rec = parseKv(W, "group:" + GID);
+    cek("grup Free mengetuk saklar captcha -> TIDAK berubah + catatan Premium per group",
+        rec.settings.captcha === false &&
+        terakhir(W).text.includes("Premium per group"), terakhir(W).text.slice(0, 200));
+    await handleUpdate(W.io, cb(666, "grp:set:bw:" + GID));
+    rec = parseKv(W, "group:" + GID);
+    cek("grup Free mengetuk saklar kata terlarang -> TIDAK berubah",
+        rec.settings.badwordsOn === false, "");
+    // Akses lewat status admin grup (getChatMember), bukan daftar pengelola.
+    await handleUpdate(W.io, msg(777, "🛡️ My Groups"));
+    const btn777 = (terakhir(W).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+    cek("admin grup (via getChatMember) melihat grup di My Groups",
+        btn777.includes("grp:open:" + GID), JSON.stringify(btn777));
+    await handleUpdate(W.io, cb(777, "grp:open:" + GID));
+    cek("admin grup bisa membuka panel", terakhir(W).text.includes("Grup Uji"), "");
+    rec = parseKv(W, "group:" + GID);
+    cek("admin terkonfirmasi tercatat sebagai pengelola (self-healing)",
+        rec.managers.includes(777), JSON.stringify(rec.managers));
+    // Bukan pengelola -> ditolak.
+    await handleUpdate(W.io, msg(888, "🛡️ My Groups"));
+    cek("bukan pengelola: daftar kosong sopan",
+        terakhir(W).text.includes("don't manage any group"), terakhir(W).text.slice(0, 120));
+    await handleUpdate(W.io, cb(888, "grp:open:" + GID));
+    cek("bukan pengelola membuka panel langsung -> ditolak",
+        terakhir(W).text.includes("don't manage that group"), terakhir(W).text.slice(0, 150));
+    // Pemilik bot melihat semua grup + panel berstatus Owner.
+    await handleUpdate(W.io, msg(111, "🛡️ My Groups"));
+    const btn111 = (terakhir(W).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+    cek("pemilik bot melihat grup terdaftar",
+        btn111.includes("grp:open:" + GID), JSON.stringify(btn111));
+    await handleUpdate(W.io, cb(111, "grp:open:" + GID));
+    cek("panel untuk pemilik: '👑 Owner — all features open', tanpa tombol upgrade",
+        terakhir(W).text.includes("👑 Owner") &&
+        !(terakhir(W).markup?.inline_keyboard || []).flat()
+          .some(b => b.callback_data === "grp:buy:" + GID), terakhir(W).text.slice(0, 200));
+    // Bot dikeluarkan -> grup nonaktif; moderasi berhenti; panel hilang.
+    await handleUpdate(W.io, botMember(GID, 666, "administrator", "kicked"));
+    rec = parseKv(W, "group:" + GID);
+    cek("bot dikeluarkan -> record active=false (data tidak dihapus)",
+        !!rec && rec.active === false && !!rec.settings, JSON.stringify(rec && rec.active));
+    await handleUpdate(W.io, msg(666, "🛡️ My Groups"));
+    cek("sesudah bot keluar: grup hilang dari daftar pengelola",
+        terakhir(W).text.includes("don't manage any group"), terakhir(W).text.slice(0, 120));
+    const delSebelum = W.deletions.length;
+    const uLink = gmsg(GID, 999, "klik https://spam.example/x");
+    await handleUpdate(W.io, uLink);
+    cek("grup nonaktif: pesan bertautan TIDAK dimoderasi",
+        W.deletions.length === delSebelum, String(W.deletions.length));
+  }
+
+  // ---- (b) Captcha tombol + sambutan + kata terlarang (grup Premium) ----
+  {
+    const GID = -100777;
+    const W = buatIo({ ai: AI_ON, adminId: 111 });
+    W.kv.set("groupprem:" + GID,
+      new Date(Date.now() + 30 * 86400000).toISOString());
+    await handleUpdate(W.io, botMember(GID, 666, "left", "administrator"));
+    await handleUpdate(W.io, cb(666, "grp:open:" + GID));
+    cek("panel grup Premium: baris paket 'Premium until'",
+        terakhir(W).text.includes("Premium until"), terakhir(W).text.slice(0, 250));
+    await handleUpdate(W.io, cb(666, "grp:set:cap:" + GID));
+    let rec = parseKv(W, "group:" + GID);
+    cek("captcha dinyalakan dari panel (Premium) -> settings.captcha=true + tombol panel menampilkan ON",
+        rec.settings.captcha === true &&
+        (terakhir(W).markup?.inline_keyboard || []).flat()
+          .some(b => b.text.includes("New-member check: ✅ ON")), "");
+    await handleUpdate(W.io, gjoin(GID, 666, [{ id: 999, first_name: "Newbie" }]));
+    cek("anggota baru + captcha menyala -> dibatasi (semua hak kirim mati)",
+        W.restricts.length === 1 && W.restricts[0].userId === 999 &&
+        W.restricts[0].permissions.can_send_messages === false &&
+        W.restricts[0].permissions.can_send_photos === false,
+        JSON.stringify(W.restricts));
+    const capMsg = keGrup(W, GID).find(x => x.msgId &&
+      x.text.includes("prove you're a real person"));
+    cek("pesan captcha terkirim berisi tombol khusus anggota itu + penjelasan batasan",
+        !!capMsg &&
+        (capMsg.markup?.inline_keyboard || []).flat()
+          .some(b => b.callback_data === `grp:cap:${GID}:999`) &&
+        capMsg.text.includes("can't send messages"),
+        capMsg ? capMsg.text.slice(0, 150) : "pesan captcha tidak ada");
+    let mrec = parseKv(W, `gmember:${GID}:999`);
+    cek("record anggota: captchaPending=true",
+        !!mrec && mrec.captchaPending === true, JSON.stringify(mrec));
+    await handleUpdate(W.io, cbg(GID, 888, `grp:cap:${GID}:999`));
+    cek("ketukan pengguna LAIN -> ditolak sopan di jawaban callback",
+        (W.cbJawaban[W.cbJawaban.length - 1]?.text || "").includes("only they can tap"),
+        JSON.stringify(W.cbJawaban));
+    cek("ketukan orang lain: batas TIDAK dibuka, tetap pending",
+        W.restricts.length === 1 &&
+        parseKv(W, `gmember:${GID}:999`).captchaPending === true, "");
+    await handleUpdate(W.io, cbg(GID, 999, `grp:cap:${GID}:999`));
+    cek("ketukan benar -> batas dibuka (hak dasar kembali)",
+        W.restricts.length === 2 && W.restricts[1].userId === 999 &&
+        W.restricts[1].permissions.can_send_messages === true,
+        JSON.stringify(W.restricts[1] || {}));
+    cek("ketukan benar -> pesan captcha dihapus",
+        W.deletions.some(d => d.chatId === GID && d.messageId === capMsg.msgId),
+        JSON.stringify(W.deletions));
+    cek("sesudah captcha lolos -> sambutan terkirim menyebut nama + grup",
+        teksGrup(W, GID).includes("Welcome,") &&
+        teksGrup(W, GID).includes("Grup Uji"), teksGrup(W, GID).slice(-300));
+    mrec = parseKv(W, `gmember:${GID}:999`);
+    cek("record anggota: captchaPending=false + welcomed=true",
+        !!mrec && mrec.captchaPending === false && mrec.welcomed === true,
+        JSON.stringify(mrec));
+    // Jalur chat_member bekerja, dan gabungan ganda tidak diproses dua kali.
+    await handleUpdate(W.io, chatMemberJoin(GID, { id: 998, first_name: "Second" }));
+    cek("gabung via chat_member -> captcha juga berlaku (dibatasi)",
+        W.restricts.filter(r => r.userId === 998).length === 1,
+        JSON.stringify(W.restricts.map(r => r.userId)));
+    await handleUpdate(W.io, gjoin(GID, 666, [{ id: 998, first_name: "Second" }]));
+    cek("gabungan yang sama via pesan layanan -> TIDAK diproses ulang",
+        W.restricts.filter(r => r.userId === 998).length === 1 &&
+        keGrup(W, GID).filter(x => x.text.includes("prove you're a real person")).length === 2,
+        String(W.restricts.length));
+    // Kelola kata terlarang lewat panel + state mengetik.
+    await handleUpdate(W.io, cb(666, "grp:bwlist:" + GID));
+    cek("daftar kata kosong -> teks 'No banned words yet'",
+        terakhir(W).text.includes("No banned words yet"), terakhir(W).text.slice(0, 150));
+    await handleUpdate(W.io, cb(666, "grp:bwadd:" + GID));
+    cek("ketuk Add a word -> diminta mengetik kata",
+        terakhir(W).text.includes("Send me the word or phrase to ban"),
+        terakhir(W).text.slice(0, 150));
+    await handleUpdate(W.io, msg(666, "Kasino"));
+    rec = parseKv(W, "group:" + GID);
+    cek("kata tersimpan ternormalisasi huruf kecil + daftar menampilkannya",
+        JSON.stringify(rec.settings.badwords) === JSON.stringify(["kasino"]) &&
+        terakhir(W).text.includes("kasino"), terakhir(W).text.slice(0, 200));
+    await handleUpdate(W.io, cb(666, "grp:bwadd:" + GID));
+    await handleUpdate(W.io, msg(666, "judi online"));
+    await handleUpdate(W.io, cb(666, "grp:bwdel:" + GID + ":1"));
+    rec = parseKv(W, "group:" + GID);
+    cek("hapus per kata via tombol -> tersisa kata pertama",
+        JSON.stringify(rec.settings.badwords) === JSON.stringify(["kasino"]),
+        JSON.stringify(rec.settings.badwords));
+    await handleUpdate(W.io, cb(666, "grp:set:bw:" + GID));
+    rec = parseKv(W, "group:" + GID);
+    cek("kata terlarang dinyalakan -> badwordsOn=true",
+        rec.settings.badwordsOn === true, "");
+    // Anggota lama melanggar kata terlarang (case-insensitive).
+    W.kv.set(`gmember:${GID}:555`, JSON.stringify({
+      joinedAt: Date.now() - 3 * 86400000, welcomed: true,
+      captchaPending: false, captchaMsgId: null }));
+    const uBad = gmsg(GID, 555, "main KASINO sekarang");
+    await handleUpdate(W.io, uBad);
+    cek("pesan memuat kata terlarang -> dihapus + teguran langkah 1",
+        W.deletions.some(d => d.messageId === uBad.message.message_id) &&
+        teksGrup(W, GID).includes("first warning"),
+        teksGrup(W, GID).slice(-300));
+    // Statistik + log dari panel (grup Premium).
+    await handleUpdate(W.io, cb(666, "grp:stats:" + GID));
+    cek("statistik minggu ini: anggota baru 2, terhapus 1",
+        terakhir(W).text.includes("New members: 2") &&
+        terakhir(W).text.includes("Messages removed: 1") &&
+        terakhir(W).text.includes("Members muted: 0"),
+        terakhir(W).text.slice(0, 250));
+    await handleUpdate(W.io, cb(666, "grp:log:" + GID));
+    cek("log tindakan memuat entri teguran terakhir",
+        terakhir(W).text.includes("Recent actions") &&
+        terakhir(W).text.includes("Warning issued"),
+        terakhir(W).text.slice(0, 250));
+  }
+
+  // ---- (c) Tangga peringatan anti-tautan di grup Free ----
+  {
+    const GID = -100666;
+    const W = buatIo({ ai: AI_ON, adminId: 111,
+      memberStatus: { "-100666:777": "administrator" } });
+    await handleUpdate(W.io, botMember(GID, 777, "left", "administrator"));
+    await handleUpdate(W.io, gjoin(GID, 777, [{ id: 999, first_name: "Newbie" }]));
+    const u1 = gmsg(GID, 999, "klik https://spam.example/x",
+      { entities: [{ type: "url", offset: 5, length: 20 }] });
+    await handleUpdate(W.io, u1);
+    cek("langkah 1: pesan bertautan pendatang dihapus",
+        W.deletions.some(d => d.messageId === u1.message.message_id),
+        JSON.stringify(W.deletions));
+    cek("langkah 1: teguran tertulis menyebut nama + ancaman bisu berikutnya",
+        teksGrup(W, GID).includes("Tester: your message was removed") &&
+        teksGrup(W, GID).includes("first warning") &&
+        teksGrup(W, GID).includes("muted for 1 hour"),
+        teksGrup(W, GID).slice(-350));
+    let w = parseKv(W, `gwarn:${GID}:999`);
+    cek("langkah 1: cacah peringatan=1 tersimpan",
+        !!w && w.count === 1, JSON.stringify(w));
+    const statKey = [...W.kv.keys()].find(k => k.startsWith(`gstat:${GID}:`));
+    let st = parseKv(W, statKey);
+    cek("statistik: joined=1, deleted=1 sesudah langkah 1",
+        !!st && st.joined === 1 && st.deleted === 1, JSON.stringify(st));
+    const u2 = gmsg(GID, 999, "coba www.spam.example lagi");
+    await handleUpdate(W.io, u2);
+    const bisu = W.restricts.find(r => r.userId === 999 && r.untilDate > 0);
+    cek("langkah 2: terhapus + dibisukan ±1 jam (until_date masa depan)",
+        W.deletions.some(d => d.messageId === u2.message.message_id) &&
+        !!bisu && bisu.untilDate > Math.floor(Date.now() / 1000) + 3000 &&
+        bisu.permissions.can_send_messages === false,
+        JSON.stringify(W.restricts));
+    cek("langkah 2: pemberitahuan bisu di grup",
+        teksGrup(W, GID).includes("muted for 1 hour (second warning)"),
+        teksGrup(W, GID).slice(-300));
+    const u3 = gmsg(GID, 999, "https://spam.example/terus");
+    await handleUpdate(W.io, u3);
+    cek("langkah 3: terhapus + dikeluarkan (ban lalu unban agar bisa kembali)",
+        W.deletions.some(d => d.messageId === u3.message.message_id) &&
+        W.bans.some(b => b.userId === 999) &&
+        W.unbans.some(b => b.userId === 999), "");
+    cek("langkah 3: cacah peringatan dibersihkan untuk awal baru",
+        !W.kv.has(`gwarn:${GID}:999`), "");
+    st = parseKv(W, statKey);
+    cek("statistik akhir: deleted=3, muted=1, kicked=1",
+        !!st && st.deleted === 3 && st.muted === 1 && st.kicked === 1,
+        JSON.stringify(st));
+    const log = parseKv(W, "glog:" + GID) || [];
+    cek("log grup memuat warn + mute + kick",
+        ["warn", "mute", "kick"].every(k => log.some(e => e.kind === k)),
+        JSON.stringify(log.map(e => e.kind)));
+    // Statistik penuh terkunci di Free; log tetap bisa dibuka.
+    await handleUpdate(W.io, cb(777, "grp:stats:" + GID));
+    cek("grup Free membuka statistik -> catatan Premium per group",
+        terakhir(W).text.includes("Premium per group"),
+        terakhir(W).text.slice(0, 200));
+    await handleUpdate(W.io, cb(777, "grp:log:" + GID));
+    cek("grup Free tetap bisa membuka log tindakan",
+        terakhir(W).text.includes("Warning issued") &&
+        terakhir(W).text.includes("Removed from group"),
+        terakhir(W).text.slice(0, 300));
+    // Admin grup kebal walau pendatang; anggota lama bebas tautan.
+    W.kv.set(`gmember:${GID}:777`, JSON.stringify({
+      joinedAt: Date.now(), welcomed: true,
+      captchaPending: false, captchaMsgId: null }));
+    const delSebelum = W.deletions.length;
+    await handleUpdate(W.io, gmsg(GID, 777, "https://contoh.example/aman"));
+    cek("admin grup mengirim tautan sebagai pendatang -> kebal, tidak dihapus",
+        W.deletions.length === delSebelum, "");
+    W.kv.set(`gmember:${GID}:555`, JSON.stringify({
+      joinedAt: Date.now() - 3 * 86400000, welcomed: true,
+      captchaPending: false, captchaMsgId: null }));
+    await handleUpdate(W.io, gmsg(GID, 555, "https://contoh.example/lama"));
+    cek("anggota lama (di luar jendela) mengirim tautan -> tidak dihapus",
+        W.deletions.length === delSebelum, "");
+    // Kata terlarang TIDAK ditegakkan di grup Free walau saklar dipaksa.
+    const rec = parseKv(W, "group:" + GID);
+    rec.settings.badwordsOn = true;
+    rec.settings.badwords = ["kasino"];
+    W.kv.set("group:" + GID, JSON.stringify(rec));
+    W.kv.set(`gmember:${GID}:444`, JSON.stringify({
+      joinedAt: Date.now(), welcomed: true,
+      captchaPending: false, captchaMsgId: null }));
+    await handleUpdate(W.io, gmsg(GID, 444, "kasino tiap hari"));
+    cek("grup Free: kata terlarang tidak ditegakkan (fitur Premium)",
+        W.deletions.length === delSebelum, "");
+  }
+
+  // ---- (f) Upgrade grup via Stars: invoice, pre-checkout, aktivasi ----
+  {
+    const GID = -100999;
+    const W = buatIo({ ai: AI_ON, adminId: 111 });
+    await handleUpdate(W.io, botMember(GID, 777, "left", "administrator"));
+    await handleUpdate(W.io, cb(777, "grp:open:" + GID));
+    cek("panel Free memuat tombol upgrade grup",
+        (terakhir(W).markup?.inline_keyboard || []).flat()
+          .some(b => b.callback_data === "grp:buy:" + GID), "");
+    await handleUpdate(W.io, cb(777, "grp:buy:" + GID));
+    cek("invoice grup terbit: XTR 250, payload groupprem:<gid>:<pembeli>",
+        W.invoices.length === 1 && W.invoices[0].inv.currency === "XTR" &&
+        W.invoices[0].inv.prices[0].amount === 250 &&
+        W.invoices[0].inv.payload === `groupprem:${GID}:777`,
+        JSON.stringify(W.invoices));
+    await handleUpdate(W.io, pre(777, `groupprem:${GID}:777`, 100));
+    cek("pre-checkout grup nominal salah -> ditolak",
+        W.prechecks.length === 1 && W.prechecks[0].ok === false, "");
+    await handleUpdate(W.io, pre(888, `groupprem:${GID}:777`, 250));
+    cek("pre-checkout grup oleh bukan pembeli -> ditolak",
+        W.prechecks[1]?.ok === false, JSON.stringify(W.prechecks));
+    await handleUpdate(W.io, pre(777, `groupprem:${GID}:777`, 250));
+    cek("pre-checkout grup benar -> ok", W.prechecks[2]?.ok === true, "");
+    await handleUpdate(W.io, paid(777, `groupprem:${GID}:777`));
+    const exp = Date.parse(W.kv.get("groupprem:" + GID) || "");
+    cek("pembayaran grup -> groupprem aktif ±30 hari",
+        exp > Date.now() + 29 * 86400000 && exp < Date.now() + 31 * 86400000,
+        W.kv.get("groupprem:" + GID) || "tidak ada");
+    cek("pembayaran grup TIDAK mengaktifkan premium pribadi pembeli",
+        !W.kv.has("premium:777"), [...W.kv.keys()].join(","));
+    cek("konfirmasi pembayaran menyebut Group Premium aktif",
+        terakhir(W).text.includes("Group Premium is active"),
+        terakhir(W).text.slice(0, 200));
+    await handleUpdate(W.io, cb(777, "grp:set:cap:" + GID));
+    const rec = parseKv(W, "group:" + GID);
+    cek("sesudah upgrade: saklar captcha terbuka dan berfungsi",
+        rec.settings.captcha === true, "");
+    await handleUpdate(W.io, cb(111, "grp:buy:" + GID));
+    cek("pemilik mengetuk upgrade grup -> TANPA invoice baru + catatan Owner",
+        W.invoices.length === 1 &&
+        terakhir(W).text.includes("👑 Owner"), terakhir(W).text.slice(0, 150));
+  }
+
+  // ---- (h) Ketahanan: hak admin hilang di tengah -> tidak crash,
+  // tercatat sekali di log ----
+  {
+    const GID = -100333;
+    const W = buatIo({ ai: AI_ON, adminId: 111, failActions: true });
+    W.kv.set("groupprem:" + GID,
+      new Date(Date.now() + 30 * 86400000).toISOString());
+    await handleUpdate(W.io, botMember(GID, 666, "left", "administrator"));
+    await handleUpdate(W.io, cb(666, "grp:set:cap:" + GID));
+    let eror = null;
+    try {
+      await handleUpdate(W.io, gjoin(GID, 666, [{ id: 999, first_name: "Newbie" }]));
+    } catch (e) { eror = e; }
+    cek("aksi dibatasi gagal (hak kurang) -> update TIDAK crash",
+        !eror, eror ? String(eror) : "");
+    let log = parseKv(W, "glog:" + GID) || [];
+    cek("kegagalan hak tercatat SEKALI sebagai entri noadmin di log grup",
+        log.filter(e => e.kind === "noadmin").length === 1,
+        JSON.stringify(log.map(e => e.kind)));
+    const mrec = parseKv(W, `gmember:${GID}:999`);
+    cek("anggota tidak tertahan pending captcha sesudah kegagalan hak",
+        !!mrec && mrec.captchaPending === false, JSON.stringify(mrec));
+    try {
+      await handleUpdate(W.io, gjoin(GID, 666, [{ id: 998, first_name: "Second" }]));
+    } catch (e) { eror = e; }
+    log = parseKv(W, "glog:" + GID) || [];
+    cek("kegagalan kedua di hari sama -> tetap satu entri noadmin, tetap tidak crash",
+        !eror && log.filter(e => e.kind === "noadmin").length === 1,
+        JSON.stringify(log.map(e => e.kind)));
+  }
+
+  // ---- (j) Modul groups mati -> panel menolak jujur, grup diam ----
+  {
+    const W = buatIo({ ai: AI_ON, adminId: 111 });
+    W.kv.set("config:modules", JSON.stringify(
+      { ai: true, download: true, groups: false, anon: true }));
+    await handleUpdate(W.io, msg(1234, "🛡️ My Groups"));
+    cek("modul groups off -> pesan 'temporarily off'",
+        terakhir(W).text.includes("temporarily off"),
+        terakhir(W).text.slice(0, 120));
+    await handleUpdate(W.io, botMember(-100222, 666, "left", "administrator"));
+    cek("modul groups off -> kejadian grup tidak dicatat/diumumkan",
+        !W.kv.has("group:-100222") &&
+        keGrup(W, -100222).length === 0, "");
+  }
 }
 
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);

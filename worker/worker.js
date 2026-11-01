@@ -1,6 +1,7 @@
 // WesioBot — public multi-tool Telegram bot (Phase 1: AI + Downloader +
-// Premium via Telegram Stars). Runs as a Cloudflare Worker webhook:
-// Telegram calls this endpoint on every update; replies are instant.
+// Premium via Telegram Stars; Phase 2: Group Moderation). Runs as a
+// Cloudflare Worker webhook: Telegram calls this endpoint on every
+// update; replies are instant.
 //
 // Division of work (same proven pattern as the botdaftar project):
 // - This Worker: conversation, menus, quotas, Premium, AI calls.
@@ -206,7 +207,7 @@ function teksWelcome(nama) {
   return `${awal} I'm Wesio — one bot with several tools inside.\n\n` +
     "🤖 AI Chat — ask questions, write, translate, summarize\n" +
     "⬇️ Downloader — save videos & audio from almost any site\n" +
-    "🛡️ Group Moderation — coming in Phase 2\n" +
+    "🛡️ Group Moderation — add me as a group admin and I'll guard it\n" +
     "💬 Anonymous Chat — coming in Phase 3\n" +
     "⭐ Premium — bigger quotas and the strongest AI model\n\n" +
     "Just tap a button below to begin. Free to use — Premium is optional.";
@@ -222,19 +223,14 @@ const TEKS_HELP =
   "Vimeo, Reddit, and 1,000+ more), choose Video or Audio, and the " +
   "file arrives here. You can also paste a link straight into this " +
   "chat.\n\n" +
+  "🛡️ My Groups — add me to your group as an admin and I'll keep it " +
+  "clean: link control for new members, a tap-to-join check, banned " +
+  "words, a welcome message and step-by-step warnings. Tap " +
+  "🛡️ My Groups to set it all up with buttons.\n\n" +
   "⭐ Premium — one subscription raises every quota and unlocks the strong " +
   "AI model. Tap ⭐ Premium to compare Free vs Premium.\n\n" +
   "Quotas reset every day at 00:00 UTC. Commands if you like typing: " +
   "/start /ai /download /premium /help";
-
-const TEKS_GROUPS_SOON =
-  "🛡️ Group Moderation — coming in Phase 2\n\n" +
-  "Soon you will be able to add me to your group as an admin and I will " +
-  "help keep it clean: anti-spam, link control for new members, a " +
-  "tap-to-join check, welcome messages and step-by-step warnings — all " +
-  "set up with buttons, no commands to memorize.\n\n" +
-  "It is not live yet. 🤖 AI Chat and the ⬇️ Downloader already work — " +
-  "tap a button below.";
 
 const TEKS_ANON_SOON =
   "💬 Anonymous Chat — coming in Phase 3\n\n" +
@@ -1170,8 +1166,13 @@ async function beliPremium(io, chatId, uid) {
 
 async function tanganiPreCheckout(io, q) {
   const uid = q.from && q.from.id;
-  const cocok = q.invoice_payload === "premium:" + uid &&
-    q.currency === "XTR" && q.total_amount === LIMITS.premiumStars;
+  let cocok = q.invoice_payload === "premium:" + uid;
+  // Group Premium payloads name the group AND the buyer; the buyer
+  // must be the one checking out.
+  const m = /^groupprem:(-?\d+):(\d+)$/.exec(q.invoice_payload || "");
+  if (m) cocok = String(m[2]) === String(uid);
+  cocok = cocok && q.currency === "XTR" &&
+    q.total_amount === LIMITS.premiumStars;
   if (cocok) {
     await io.answerPreCheckout(q.id, true);
   } else {
@@ -1186,6 +1187,24 @@ async function tanganiPembayaran(io, msg) {
   const uid = msg.from && msg.from.id;
   const sp = msg.successful_payment;
   if (!sp || chatId == null || uid == null) return;
+  // Group Premium: activates groupprem:<gid> only — the buyer's
+  // personal premium:<uid> record is never touched by a group payment.
+  const mg = /^groupprem:(-?\d+):(\d+)$/.exec(sp.invoice_payload || "");
+  if (mg && String(mg[2]) === String(uid) && sp.currency === "XTR") {
+    const gid = mg[1];
+    const sampai = new Date(Date.now() + LIMITS.premiumDays * 86400000);
+    await io.kvPut("groupprem:" + gid, sampai.toISOString());
+    const rec = await muatGrup(io, gid);
+    await catatLogGrup(io, gid, "premium", uid,
+      (msg.from && msg.from.first_name) || "");
+    await io.send(chatId,
+      "🎉 Group Premium is active!\n\n" +
+      `${rec ? rec.title : "Your group"} now has every group feature ` +
+      "— the new-member tap check, banned words and full weekly " +
+      `stats — until ${sampai.toISOString().slice(0, 10)} (UTC).\n\n` +
+      "Open 🛡️ My Groups to switch them on.", MENU_MARKUP);
+    return;
+  }
   if (sp.invoice_payload === "premium:" + uid && sp.currency === "XTR") {
     const sampai = new Date(Date.now() + LIMITS.premiumDays * 86400000);
     await io.kvPut("premium:" + uid, sampai.toISOString());
@@ -1200,6 +1219,928 @@ async function tanganiPembayaran(io, msg) {
       "account, so I didn't change anything. If you paid and Premium " +
       "is not active, please open /premium and check your status.",
       MENU_MARKUP);
+  }
+}
+
+// ---------------- Module: Group Moderation ----------------
+// The bot guards groups where it is an admin. All settings live behind
+// the 🛡️ My Groups button in a PRIVATE chat with a group manager — no
+// commands to memorize (concept §2/§6). KV layout:
+//   group:<gid>         group record {title, active, botAdmin, addedBy,
+//                       managers: [uid], settings: {captcha, antilink,
+//                       badwordsOn, badwords: [], welcomeOn, welcomeText}}
+//   groupprem:<gid>     this group's Premium expiry (ISO) — separate
+//                       from the personal premium:<uid> records
+//   gmember:<gid>:<uid> member record {joinedAt (ms), welcomed,
+//                       captchaPending, captchaMsgId}
+//   gwarn:<gid>:<uid>   warning ladder {count, last (ms)} — a step
+//                       expires 7 days after the previous violation
+//   glog:<gid>          last 50 moderation actions [{at, kind, uid, name}]
+//   gstat:<gid>:<week>  weekly counters {joined, deleted, muted, kicked}
+//   gadm:<gid>:<uid>    cached group-admin status (10 min)
+//   gnoadmin:<gid>:<date> "bot lacks admin rights" log guard (1/day)
+//
+// Free vs Premium is PER GROUP: every group without an active
+// subscription runs the basic set (newcomer link control + welcome
+// message); the tap-to-join check, banned words and full weekly stats
+// are Premium per group. The bot owner manages every group as Premium
+// and never gets an invoice (same full-access rule as everywhere).
+
+const IZIN_MATI = { can_send_messages: false, can_send_audios: false,
+  can_send_documents: false, can_send_photos: false,
+  can_send_videos: false, can_send_video_notes: false,
+  can_send_voice_notes: false, can_send_polls: false,
+  can_send_other_messages: false, can_add_web_page_previews: false };
+const IZIN_BEBAS = { can_send_messages: true, can_send_audios: true,
+  can_send_documents: true, can_send_photos: true,
+  can_send_videos: true, can_send_video_notes: true,
+  can_send_voice_notes: true, can_send_polls: true,
+  can_send_other_messages: true, can_add_web_page_previews: true };
+
+const SAMBUTAN_BAWAAN =
+  "👋 Welcome, {name}! Glad to have you in {group}. " +
+  "Please be kind, no spam — and enjoy your stay!";
+
+const CATATAN_PREMIUM_GRUP =
+  "⭐ That feature is Premium per group. On the Free plan this group " +
+  "gets link control for new members and the welcome message. Tap " +
+  "⭐ Upgrade in this panel to unlock everything for this group.";
+
+function setelanGrupBawaan() {
+  return { captcha: false, antilink: 86400, badwordsOn: false,
+    badwords: [], welcomeOn: true, welcomeText: null };
+}
+
+function mingguISO(d = new Date()) {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(),
+    d.getUTCDate()));
+  const day = (t.getUTCDay() + 6) % 7; // Monday = 0
+  t.setUTCDate(t.getUTCDate() - day + 3); // Thursday of this week
+  const first = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+  const fday = (first.getUTCDay() + 6) % 7;
+  first.setUTCDate(first.getUTCDate() - fday + 3);
+  const week = 1 + Math.round((t - first) / (7 * 86400000));
+  return `${t.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+async function muatGrup(io, gid) {
+  try {
+    const v = await io.kvGet("group:" + gid);
+    if (!v) return null;
+    const r = JSON.parse(v);
+    if (!r || typeof r !== "object") return null;
+    r.settings = Object.assign(setelanGrupBawaan(), r.settings || {});
+    if (!Array.isArray(r.settings.badwords)) r.settings.badwords = [];
+    if (!Array.isArray(r.managers)) r.managers = [];
+    return r;
+  } catch (e) { return null; }
+}
+
+async function simpanGrup(io, gid, rec) {
+  await io.kvPut("group:" + gid, JSON.stringify(rec));
+}
+
+// A group counts as Premium when its own subscription is active, or
+// when the bot owner is one of its managers (owner = full access).
+async function grupPremAktif(io, gid, rec) {
+  if (rec && (String(rec.addedBy) === String(io.adminId) ||
+      rec.managers.some(m => String(m) === String(io.adminId)))) {
+    return true;
+  }
+  const v = await io.kvGet("groupprem:" + gid);
+  if (!v) return false;
+  const t = Date.parse(v);
+  return !Number.isNaN(t) && t > Date.now();
+}
+
+async function catatLogGrup(io, gid, kind, uid, name) {
+  let log = [];
+  try {
+    const v = JSON.parse((await io.kvGet("glog:" + gid)) || "[]");
+    if (Array.isArray(v)) log = v;
+  } catch (e) { /* a broken log must never take moderation down */ }
+  log.unshift({ at: new Date().toISOString(), kind,
+    uid: uid == null ? null : uid, name: name || "" });
+  await io.kvPut("glog:" + gid, JSON.stringify(log.slice(0, 50)));
+}
+
+async function statGrupTambah(io, gid, field) {
+  const k = `gstat:${gid}:${mingguISO()}`;
+  const s = { joined: 0, deleted: 0, muted: 0, kicked: 0 };
+  try { Object.assign(s, JSON.parse((await io.kvGet(k)) || "{}")); }
+  catch (e) { /* start from zero */ }
+  s[field] = (s[field] || 0) + 1;
+  await io.kvPut(k, JSON.stringify(s), 70 * 86400); // TTL 70 hari
+}
+
+async function muatStatGrup(io, gid) {
+  const s = { joined: 0, deleted: 0, muted: 0, kicked: 0 };
+  try {
+    Object.assign(s,
+      JSON.parse((await io.kvGet(`gstat:${gid}:${mingguISO()}`)) || "{}"));
+  } catch (e) { /* zeros */ }
+  return s;
+}
+
+// Group admin actions must never crash the update flow: when the bot
+// lacks the rights for an action (demoted in a way we did not see,
+// rights trimmed mid-flight), the action is skipped and the loss is
+// written to the group log at most once a day.
+async function aksiGrup(io, gid, fn) {
+  try { await fn(); return true; }
+  catch (e) {
+    const kunci = `gnoadmin:${gid}:${hariIniUTC()}`;
+    if (!(await io.kvGet(kunci))) {
+      await io.kvPut(kunci, "1", 172800);
+      await catatLogGrup(io, gid, "noadmin", null, "");
+    }
+    return false;
+  }
+}
+
+// Telegram status of a user inside one group. Confirmed admins are
+// cached for 10 minutes so busy groups don't cost an API call per
+// message; everyone else is looked up live.
+async function statusAnggotaGrup(io, gid, uid) {
+  const kunci = `gadm:${gid}:${uid}`;
+  const c = await io.kvGet(kunci);
+  if (c) return c;
+  try {
+    const m = await io.getChatMember(gid, uid);
+    const st = (m && m.status) || "member";
+    if (st === "administrator" || st === "creator") {
+      await io.kvPut(kunci, st, 600);
+    }
+    return st;
+  } catch (e) { return "member"; }
+}
+
+// May this user manage this group from the private panel? The person
+// who added the bot, anyone recorded as a manager, anyone Telegram
+// itself calls a group admin/creator — and the bot owner, always.
+async function aksesGrup(io, rec, gid, uid) {
+  if (adalahAdmin(io, uid)) return true;
+  if (rec && (String(rec.addedBy) === String(uid) ||
+      rec.managers.some(m => String(m) === String(uid)))) return true;
+  const st = await statusAnggotaGrup(io, gid, uid);
+  if (st === "administrator" || st === "creator") {
+    // Remember confirmed group admins so the panel keeps working
+    // even if the status check is unavailable next time.
+    if (rec && !rec.managers.some(m => String(m) === String(uid))) {
+      rec.managers.push(uid);
+      await simpanGrup(io, gid, rec);
+    }
+    return true;
+  }
+  return false;
+}
+
+async function tolakAksesGrup(io, chatId) {
+  await io.send(chatId,
+    "You don't manage that group, so I can't do that. The person who " +
+    "added me and the group's admins can open its settings from " +
+    "🛡️ My Groups.", MENU_MARKUP);
+}
+
+// ---- group membership lifecycle (my_chat_member / chat_member) ----
+async function tanganiMyChatMember(io, upd) {
+  const chat = upd.chat || {};
+  if (chat.type !== "group" && chat.type !== "supergroup") return;
+  if (!(await modulAktif(io, "groups"))) return;
+  const gid = chat.id;
+  const statusBaru = (upd.new_chat_member || {}).status;
+  const statusLama = (upd.old_chat_member || {}).status;
+  const dari = (upd.from || {}).id;
+  let rec = await muatGrup(io, gid);
+  if (statusBaru === "left" || statusBaru === "kicked") {
+    // Removed from the group: mark inactive, keep the data (settings,
+    // log, stats) in case the bot is added back later.
+    if (rec && rec.active) {
+      rec.active = false;
+      rec.botAdmin = false;
+      await simpanGrup(io, gid, rec);
+    }
+    return;
+  }
+  if (!rec) {
+    rec = { title: chat.title || "Group", active: true, botAdmin: false,
+      addedBy: dari == null ? null : dari,
+      managers: dari == null ? [] : [dari],
+      settings: setelanGrupBawaan() };
+  }
+  rec.title = chat.title || rec.title;
+  rec.active = true;
+  if (dari != null && !rec.managers.some(m => String(m) === String(dari))) {
+    // The person who added or promoted the bot manages it here.
+    if (rec.addedBy == null) rec.addedBy = dari;
+    rec.managers.push(dari);
+  }
+  if (statusBaru === "administrator") {
+    const belumAdmin = !rec.botAdmin;
+    rec.botAdmin = true;
+    await simpanGrup(io, gid, rec);
+    if (belumAdmin) {
+      await io.send(gid,
+        `🛡️ Group protection is ON for ${rec.title}.\n\n` +
+        "I'll remove spam links from brand-new members and greet " +
+        "newcomers. Group admins: open a private chat with me and " +
+        "tap 🛡️ My Groups to tune everything with buttons.");
+    }
+    return;
+  }
+  rec.botAdmin = false;
+  await simpanGrup(io, gid, rec);
+  if (statusBaru === "member" &&
+      (statusLama === "left" || statusLama === "kicked")) {
+    // Freshly added but powerless: without admin rights the bot does
+    // not receive all messages and cannot remove anything.
+    await io.send(gid,
+      "👋 Hi, and thanks for adding me!\n\n" +
+      "To guard this group — remove spam, check new members — I " +
+      "need to be an admin here. Please promote me: open the group " +
+      "settings → Administrators → Add admin → choose me.\n\n" +
+      "Until then I can't see or remove other people's messages.");
+  }
+}
+
+async function tanganiChatMember(io, upd) {
+  const chat = upd.chat || {};
+  if (chat.type !== "group" && chat.type !== "supergroup") return;
+  if (!(await modulAktif(io, "groups"))) return;
+  const user = upd.user || (upd.new_chat_member || {}).user || {};
+  if (!user.id || user.is_bot) return; // also skips the bot itself
+  const gid = chat.id;
+  const stBaru = (upd.new_chat_member || {}).status;
+  const stLama = (upd.old_chat_member || {}).status;
+  if (stBaru === "left" || stBaru === "kicked") {
+    await io.kvDel(`gmember:${gid}:${user.id}`);
+    return;
+  }
+  const bergabung = (stLama === "left" || stLama === "kicked" || !stLama) &&
+    (stBaru === "member" || stBaru === "restricted");
+  if (!bergabung) return;
+  const rec = await muatGrup(io, gid);
+  if (!rec || !rec.active) return;
+  await prosesAnggotaBaru(io, gid, rec, user);
+}
+
+async function tanganiGabungPesan(io, msg) {
+  if (!(await modulAktif(io, "groups"))) return;
+  const gid = msg.chat.id;
+  let rec = await muatGrup(io, gid);
+  if (!rec) {
+    rec = { title: msg.chat.title || "Group", active: true,
+      botAdmin: false, addedBy: null, managers: [],
+      settings: setelanGrupBawaan() };
+    await simpanGrup(io, gid, rec);
+  }
+  if (!rec.active) return;
+  for (const member of msg.new_chat_members || []) {
+    if (!member || member.is_bot || member.id == null) continue;
+    await prosesAnggotaBaru(io, gid, rec, member);
+  }
+}
+
+// ---- joins: captcha, welcome ----
+async function kirimSambutan(io, gid, rec, uid, m, nama) {
+  if (!rec.settings.welcomeOn || m.welcomed) return;
+  const teks = (rec.settings.welcomeText || SAMBUTAN_BAWAAN)
+    .replace(/\{name\}/g, nama)
+    .replace(/\{group\}/g, rec.title || "this group");
+  try { await io.send(gid, teks); } catch (e) { /* group may be gone */ }
+  m.welcomed = true;
+  await io.kvPut(`gmember:${gid}:${uid}`, JSON.stringify(m), 30 * 86400);
+}
+
+async function prosesAnggotaBaru(io, gid, rec, member) {
+  const uid = member.id;
+  const nama = member.first_name || "there";
+  const kunci = `gmember:${gid}:${uid}`;
+  let lama = null;
+  try { lama = JSON.parse((await io.kvGet(kunci)) || "null"); }
+  catch (e) { lama = null; }
+  const now = Date.now();
+  // The same join can arrive twice (service message + chat_member
+  // update): process each join only once.
+  if (lama && now - (lama.joinedAt || 0) < 3600000) return;
+  const m = { joinedAt: now, welcomed: false,
+    captchaPending: false, captchaMsgId: null };
+  await io.kvPut(kunci, JSON.stringify(m), 30 * 86400);
+  await statGrupTambah(io, gid, "joined");
+  const prem = await grupPremAktif(io, gid, rec);
+  if (rec.settings.captcha && prem && rec.botAdmin) {
+    const ok = await aksiGrup(io, gid, () =>
+      io.restrictMember(gid, uid, IZIN_MATI, 0));
+    if (ok) {
+      m.captchaPending = true;
+      try {
+        m.captchaMsgId = await io.sendMsgId(gid,
+          `👋 Welcome, ${nama}! One quick check before you can post: ` +
+          "tap the button below to prove you're a real person. " +
+          "Until you tap it, you can't send messages in this group — " +
+          "that's how we keep spam bots out.",
+          { inline_keyboard: [[
+            { text: "✅ I'm human",
+              callback_data: `grp:cap:${gid}:${uid}` }]] });
+      } catch (e) { m.captchaMsgId = null; }
+      await io.kvPut(kunci, JSON.stringify(m), 30 * 86400);
+      return;
+    }
+    // Restricting failed (rights lost): fall through to a plain
+    // welcome so the new member is never left stuck.
+  }
+  await kirimSambutan(io, gid, rec, uid, m, nama);
+}
+
+// The captcha button only works for the member it was made for; a tap
+// from anyone else is refused politely in the callback answer itself.
+async function tanganiCaptcha(io, cq, gid, targetUid) {
+  const uid = cq.from && cq.from.id;
+  if (String(uid) !== String(targetUid)) {
+    await io.answerCallback(cq.id,
+      "This check belongs to the new member — only they can tap it.");
+    return;
+  }
+  const kunci = `gmember:${gid}:${uid}`;
+  let m = null;
+  try { m = JSON.parse((await io.kvGet(kunci)) || "null"); }
+  catch (e) { m = null; }
+  if (!m || !m.captchaPending) {
+    await io.answerCallback(cq.id,
+      "All good — you can already post in the group.");
+    return;
+  }
+  const ok = await aksiGrup(io, gid, () =>
+    io.restrictMember(gid, uid, IZIN_BEBAS, 0));
+  if (!ok) {
+    await io.answerCallback(cq.id,
+      "I couldn't lift your limit — I may be missing admin rights here.");
+    return;
+  }
+  m.captchaPending = false;
+  const mid = m.captchaMsgId;
+  m.captchaMsgId = null;
+  await io.kvPut(kunci, JSON.stringify(m), 30 * 86400);
+  if (mid) await aksiGrup(io, gid, () => io.deleteMsg(gid, mid));
+  await io.answerCallback(cq.id, "✅ You're in — welcome!");
+  const rec = await muatGrup(io, gid);
+  if (rec) {
+    await kirimSambutan(io, gid, rec, uid, m,
+      (cq.from && cq.from.first_name) || "there");
+  }
+}
+
+// ---- message moderation: links, banned words, warning ladder ----
+function mengandungTautan(teks, entities) {
+  if (Array.isArray(entities) &&
+      entities.some(e => e && (e.type === "url" || e.type === "text_link"))) {
+    return true;
+  }
+  return /(https?:\/\/|www\.|t\.me\/|telegram\.me\/)/i.test(teks || "");
+}
+
+async function prosesModerasiGrup(io, msg) {
+  const gid = msg.chat.id;
+  const dari = msg.from || {};
+  const uid = dari.id;
+  if (uid == null || dari.is_bot) return;
+  const rec = await muatGrup(io, gid);
+  if (!rec || !rec.active || !rec.botAdmin) return;
+  if (adalahAdmin(io, uid)) return; // the bot owner is always free
+  const st = await statusAnggotaGrup(io, gid, uid);
+  if (st === "administrator" || st === "creator") return; // group admins too
+  const teks = msg.text || msg.caption || "";
+  if (!teks) return;
+  const entities = msg.entities || msg.caption_entities;
+  let jenis = null;
+  // Newcomer link control (a Free feature). Members who joined before
+  // the bot arrived have no join record and count as long-standing.
+  if (rec.settings.antilink > 0 && mengandungTautan(teks, entities)) {
+    let m = null;
+    try { m = JSON.parse((await io.kvGet(`gmember:${gid}:${uid}`)) || "null"); }
+    catch (e) { m = null; }
+    if (m && Date.now() - (m.joinedAt || 0) < rec.settings.antilink * 1000) {
+      jenis = "link";
+    }
+  }
+  // Banned words (Premium per group): plain case-insensitive match on
+  // the lowercased text against the group's own list.
+  if (!jenis && rec.settings.badwordsOn &&
+      rec.settings.badwords.length &&
+      (await grupPremAktif(io, gid, rec))) {
+    const norm = teks.toLowerCase();
+    if (rec.settings.badwords.some(w => w && norm.includes(w))) {
+      jenis = "badword";
+    }
+  }
+  if (!jenis) return;
+  await tanggaPeringatan(io, gid, rec, msg, jenis);
+}
+
+// Step-by-step warnings, per user per group: 1 = delete + written
+// warning, 2 = delete + mute 1 hour, 3 = delete + remove (ban then
+// unban, so the person may join again later). A step expires 7 days
+// after the previous violation. Every step lands in the group log and
+// the weekly counters.
+async function tanggaPeringatan(io, gid, rec, msg, jenis) {
+  const uid = msg.from.id;
+  const nama = msg.from.first_name || "A member";
+  const kunci = `gwarn:${gid}:${uid}`;
+  const w = { count: 0, last: 0 };
+  try { Object.assign(w, JSON.parse((await io.kvGet(kunci)) || "{}")); }
+  catch (e) { /* start fresh */ }
+  const now = Date.now();
+  if (now - (w.last || 0) > 7 * 86400000) w.count = 0;
+  w.count += 1;
+  w.last = now;
+  await aksiGrup(io, gid, () => io.deleteMsg(gid, msg.message_id));
+  await statGrupTambah(io, gid, "deleted");
+  const sebab = jenis === "link"
+    ? "Links aren't allowed for new members in this group yet"
+    : "That word isn't allowed in this group";
+  if (w.count === 1) {
+    await io.kvPut(kunci, JSON.stringify(w), 8 * 86400);
+    await catatLogGrup(io, gid, "warn", uid, nama);
+    await io.send(gid,
+      `⚠️ ${nama}: your message was removed. ${sebab}. ` +
+      "This is your first warning — next time you'll be muted for 1 hour.");
+  } else if (w.count === 2) {
+    await io.kvPut(kunci, JSON.stringify(w), 8 * 86400);
+    await aksiGrup(io, gid, () => io.restrictMember(gid, uid, IZIN_MATI,
+      Math.floor(now / 1000) + 3600));
+    await catatLogGrup(io, gid, "mute", uid, nama);
+    await statGrupTambah(io, gid, "muted");
+    await io.send(gid,
+      `🔇 ${nama} has been muted for 1 hour (second warning). ` +
+      "One more violation and you'll be removed from the group.");
+  } else {
+    await io.kvDel(kunci); // a fresh start if they join again
+    await aksiGrup(io, gid, async () => {
+      await io.banMember(gid, uid);
+      await io.unbanMember(gid, uid);
+    });
+    await catatLogGrup(io, gid, "kick", uid, nama);
+    await statGrupTambah(io, gid, "kicked");
+    await io.send(gid,
+      `🚪 ${nama} has been removed from the group (third warning). ` +
+      "They may join again later — please follow the group rules.");
+  }
+}
+
+// ---- private panel: 🛡️ My Groups ----
+async function tampilGrupSaya(io, chatId, uid) {
+  if (!(await modulAktif(io, "groups"))) {
+    await pesanModulOff(io, chatId, "groups");
+    return;
+  }
+  // Opening the panel cancels any pending "type a word/text" input.
+  const c = await muatConv(io, uid);
+  if (c.mode === "grp_word" || c.mode === "grp_welcome") {
+    c.mode = "idle";
+    c.grpGid = null;
+    await simpanConv(io, uid, c);
+  }
+  const keys = await io.kvList("group:");
+  const tombol = [];
+  for (const k of keys) {
+    const gid = k.slice("group:".length);
+    const rec = await muatGrup(io, gid);
+    if (!rec || !rec.active) continue;
+    if (await aksesGrup(io, rec, gid, uid)) {
+      tombol.push([{ text: `🛡️ ${potong(rec.title || "Group", 40)}`,
+        callback_data: "grp:open:" + gid }]);
+    }
+  }
+  if (!tombol.length) {
+    await io.send(chatId,
+      "🛡️ My Groups\n\n" +
+      "You don't manage any group I'm in yet.\n\n" +
+      "To let me guard your group:\n" +
+      "1. Add me to the group\n" +
+      "2. Promote me to admin there (so I can remove spam)\n" +
+      "3. Come back here and tap your group to set everything up — " +
+      "all with buttons.", MENU_MARKUP);
+    return;
+  }
+  await io.send(chatId,
+    "🛡️ My Groups\n\n" +
+    "Tap a group to open its protection settings.",
+    { inline_keyboard: tombol });
+}
+
+function labelJendelaTautan(sec) {
+  if (sec === 0) return "Off";
+  if (sec === 3600) return "1h";
+  if (sec === 86400) return "24h";
+  return Math.round(sec / 3600) + "h";
+}
+
+async function tampilPanelGrup(io, chatId, uid, gid, catatan) {
+  const rec = await muatGrup(io, gid);
+  if (!rec || !rec.active) {
+    await io.send(chatId,
+      "That group is no longer active for me — I may have been " +
+      "removed from it.", MENU_MARKUP);
+    return;
+  }
+  if (!(await aksesGrup(io, rec, gid, uid))) {
+    await tolakAksesGrup(io, chatId);
+    return;
+  }
+  const prem = (await grupPremAktif(io, gid, rec)) || adalahAdmin(io, uid);
+  const s = rec.settings;
+  const sampai = await io.kvGet("groupprem:" + gid);
+  let barisPaket;
+  if (adalahAdmin(io, uid)) {
+    barisPaket = "Plan: 👑 Owner — all features open";
+  } else if (prem && sampai) {
+    barisPaket = `Plan: ⭐ Premium until ${sampai.slice(0, 10)} (UTC)`;
+  } else if (prem) {
+    barisPaket = "Plan: ⭐ Premium (via the bot owner)";
+  } else {
+    barisPaket = "Plan: Free — newcomer link control + welcome message " +
+      "included; the tap-to-join check, banned words and full stats " +
+      "are ⭐ Premium per group";
+  }
+  const rows = [
+    [{ text: prem
+        ? `👮 New-member check: ${s.captcha ? "✅ ON" : "OFF"}`
+        : "🔒 New-member check ⭐",
+      callback_data: `grp:set:cap:${gid}` }],
+    [{ text: "🔗 Newcomer links:", callback_data: "grp:noop" },
+     ...[0, 3600, 86400].map(sec => ({
+       text: (s.antilink === sec ? "● " : "") + labelJendelaTautan(sec),
+       callback_data: `grp:link:${gid}:${sec}` }))],
+    [{ text: prem
+        ? `🚫 Banned words: ${s.badwordsOn ? "✅ ON" : "OFF"}`
+        : "🔒 Banned words ⭐",
+      callback_data: `grp:set:bw:${gid}` },
+     { text: `📝 Word list (${s.badwords.length})`,
+       callback_data: `grp:bwlist:${gid}` }],
+    [{ text: `👋 Welcome message: ${s.welcomeOn ? "✅ ON" : "OFF"}`,
+       callback_data: `grp:set:wel:${gid}` },
+     { text: "✏️ Welcome text", callback_data: `grp:weledit:${gid}` }],
+    [{ text: prem ? "📊 This week's stats" : "🔒 This week's stats ⭐",
+       callback_data: `grp:stats:${gid}` },
+     { text: "📜 Recent actions", callback_data: `grp:log:${gid}` }],
+  ];
+  if (!prem) {
+    rows.push([{ text: `⭐ Upgrade this group — ${LIMITS.premiumStars} ` +
+        `Stars / ${LIMITS.premiumDays} days`,
+      callback_data: `grp:buy:${gid}` }]);
+  }
+  rows.push([{ text: "⬅️ All my groups", callback_data: "grp:list" }]);
+  await io.send(chatId,
+    (catatan ? catatan + "\n\n" : "") +
+    `🛡️ ${rec.title}\n\n` +
+    barisPaket + "\n" +
+    (rec.botAdmin
+      ? "My status here: admin ✅ — I can remove messages and limit members."
+      : "My status here: NOT an admin ⚠️ — promote me inside the " +
+        "group, otherwise I can't actually guard it.") +
+    "\n\nTap a setting to change it:",
+    { inline_keyboard: rows });
+}
+
+async function tampilDaftarKata(io, chatId, uid, gid, catatan) {
+  const rec = await muatGrup(io, gid);
+  if (!rec || !rec.active) {
+    await io.send(chatId, "That group is no longer active for me.",
+      MENU_MARKUP);
+    return;
+  }
+  if (!(await aksesGrup(io, rec, gid, uid))) {
+    await tolakAksesGrup(io, chatId);
+    return;
+  }
+  const kata = rec.settings.badwords;
+  const rows = kata.map((w, i) => [{
+    text: `❌ ${w}`, callback_data: `grp:bwdel:${gid}:${i}` }]);
+  rows.push([{ text: "➕ Add a word", callback_data: `grp:bwadd:${gid}` }]);
+  rows.push([{ text: "⬅️ Back to settings",
+    callback_data: `grp:open:${gid}` }]);
+  await io.send(chatId,
+    (catatan ? catatan + "\n\n" : "") +
+    `📝 Banned words in ${rec.title}\n\n` +
+    (kata.length
+      ? "A message containing any of these is removed and counts as " +
+        "a violation. Tap a word to remove it:\n" +
+        kata.map((w, i) => `${i + 1}. ${w}`).join("\n")
+      : "No banned words yet. Tap ➕ Add a word and type one — " +
+        "messages containing it will be removed."),
+    { inline_keyboard: rows });
+}
+
+const LABEL_LOG_GRUP = {
+  warn: "⚠️ Warning issued",
+  mute: "🔇 Muted for 1 hour",
+  kick: "🚪 Removed from group",
+  noadmin: "⚠️ I couldn't act — my admin rights are missing",
+  premium: "⭐ Group Premium activated",
+};
+
+async function tampilLogGrup(io, chatId, uid, gid) {
+  const rec = await muatGrup(io, gid);
+  if (!rec || !rec.active) {
+    await io.send(chatId, "That group is no longer active for me.",
+      MENU_MARKUP);
+    return;
+  }
+  if (!(await aksesGrup(io, rec, gid, uid))) {
+    await tolakAksesGrup(io, chatId);
+    return;
+  }
+  let log = [];
+  try {
+    const v = JSON.parse((await io.kvGet("glog:" + gid)) || "[]");
+    if (Array.isArray(v)) log = v;
+  } catch (e) { /* empty */ }
+  const baris = log.slice(0, 10).map(e => {
+    const waktu = String(e.at || "").slice(0, 10) + " " +
+      String(e.at || "").slice(11, 16);
+    const label = LABEL_LOG_GRUP[e.kind] || e.kind;
+    return `• ${waktu} UTC — ${label}${e.name ? " — " + e.name : ""}`;
+  });
+  await io.send(chatId,
+    `📜 Recent actions in ${rec.title}\n\n` +
+    (baris.length ? baris.join("\n")
+      : "No moderation actions recorded yet."),
+    { inline_keyboard: [[
+      { text: "⬅️ Back to settings", callback_data: `grp:open:${gid}` }]] });
+}
+
+async function tampilStatGrup(io, chatId, uid, gid) {
+  const rec = await muatGrup(io, gid);
+  if (!rec || !rec.active) {
+    await io.send(chatId, "That group is no longer active for me.",
+      MENU_MARKUP);
+    return;
+  }
+  if (!(await aksesGrup(io, rec, gid, uid))) {
+    await tolakAksesGrup(io, chatId);
+    return;
+  }
+  const s = await muatStatGrup(io, gid);
+  await io.send(chatId,
+    `📊 ${rec.title} — this week (from Monday, UTC)\n\n` +
+    `👥 New members: ${s.joined}\n` +
+    `🗑 Messages removed: ${s.deleted}\n` +
+    `🔇 Members muted: ${s.muted}\n` +
+    `🚪 Members removed: ${s.kicked}`,
+    { inline_keyboard: [[
+      { text: "⬅️ Back to settings", callback_data: `grp:open:${gid}` }]] });
+}
+
+// Group Premium: same Stars pattern as personal Premium, but the
+// payload names the group (groupprem:<gid>:<buyerId>) and activation
+// writes groupprem:<gid> — a different record from premium:<uid>, so
+// the two subscriptions never interfere.
+async function beliPremiumGrup(io, chatId, uid, gid) {
+  const rec = await muatGrup(io, gid);
+  if (!rec || !rec.active) {
+    await io.send(chatId, "That group is no longer active for me.",
+      MENU_MARKUP);
+    return;
+  }
+  if (!(await aksesGrup(io, rec, gid, uid))) {
+    await tolakAksesGrup(io, chatId);
+    return;
+  }
+  if (adalahAdmin(io, uid)) {
+    await io.send(chatId,
+      "👑 Owner — full access. Every group you manage already has " +
+      "all features open; no payment is needed.", MENU_MARKUP);
+    return;
+  }
+  if (await grupPremAktif(io, gid, rec)) {
+    await tampilPanelGrup(io, chatId, uid, gid,
+      "⭐ This group already has Premium active.");
+    return;
+  }
+  await io.sendInvoice(chatId, {
+    title: "WesioBot Premium — Group",
+    description: `${LIMITS.premiumDays} days of Premium for the group ` +
+      `"${potong(rec.title, 60)}": new-member tap check, banned ` +
+      "words, full weekly stats and every group feature.",
+    payload: `groupprem:${gid}:${uid}`,
+    currency: "XTR",
+    prices: [{ label: `Group Premium — ${LIMITS.premiumDays} days`,
+               amount: LIMITS.premiumStars }],
+  });
+}
+
+// ---- panel input states: type a banned word / a welcome text ----
+async function prosesKataMasuk(io, chatId, uid, teks) {
+  const c = await muatConv(io, uid);
+  const gid = c.grpGid;
+  c.mode = "idle";
+  c.grpGid = null;
+  await simpanConv(io, uid, c);
+  const rec = gid ? await muatGrup(io, gid) : null;
+  if (!rec || !rec.active || !(await aksesGrup(io, rec, gid, uid))) {
+    await io.send(chatId,
+      "That group is no longer available to manage.", MENU_MARKUP);
+    return;
+  }
+  const kata = (teks || "").trim().toLowerCase();
+  if (!kata || kata.length > 40 || kata.includes("\n")) {
+    await io.send(chatId,
+      "That doesn't work as a banned word — keep it to one short word " +
+      "or phrase (max 40 characters). Open 📝 Word list in the group " +
+      "panel to try again.", MENU_MARKUP);
+    return;
+  }
+  if (!rec.settings.badwords.includes(kata)) {
+    rec.settings.badwords.push(kata);
+    await simpanGrup(io, gid, rec);
+  }
+  await tampilDaftarKata(io, chatId, uid, gid,
+    `✅ "${kata}" is now banned in ${rec.title}.`);
+}
+
+async function prosesSambutanMasuk(io, chatId, uid, teks) {
+  const c = await muatConv(io, uid);
+  const gid = c.grpGid;
+  c.mode = "idle";
+  c.grpGid = null;
+  await simpanConv(io, uid, c);
+  const rec = gid ? await muatGrup(io, gid) : null;
+  if (!rec || !rec.active || !(await aksesGrup(io, rec, gid, uid))) {
+    await io.send(chatId,
+      "That group is no longer available to manage.", MENU_MARKUP);
+    return;
+  }
+  const baru = (teks || "").trim().slice(0, 500);
+  if (!baru) {
+    await io.send(chatId,
+      "That welcome text was empty, so nothing changed. Open " +
+      "✏️ Welcome text in the group panel to try again.", MENU_MARKUP);
+    return;
+  }
+  rec.settings.welcomeText =
+    baru.toLowerCase() === "default" ? null : baru;
+  if (rec.settings.welcomeText) rec.settings.welcomeOn = true;
+  await simpanGrup(io, gid, rec);
+  await tampilPanelGrup(io, chatId, uid, gid,
+    rec.settings.welcomeText
+      ? "✅ Welcome text updated."
+      : "✅ Welcome text reset to the standard one.");
+}
+
+// ---- group panel callback routing (private chat) ----
+async function ruteGrupCallback(io, chatId, uid, data) {
+  if (!(await modulAktif(io, "groups"))) {
+    await pesanModulOff(io, chatId, "groups");
+    return;
+  }
+  const parts = data.split(":");
+  const aksi = parts[1];
+  if (aksi === "list") { await tampilGrupSaya(io, chatId, uid); return; }
+  if (aksi === "open") {
+    await tampilPanelGrup(io, chatId, uid, parts[2]);
+    return;
+  }
+  if (aksi === "set") {
+    const fitur = parts[2];
+    const gid = parts[3];
+    const rec = await muatGrup(io, gid);
+    if (!rec || !rec.active) {
+      await io.send(chatId, "That group is no longer active for me.",
+        MENU_MARKUP);
+      return;
+    }
+    if (!(await aksesGrup(io, rec, gid, uid))) {
+      await tolakAksesGrup(io, chatId);
+      return;
+    }
+    const prem = (await grupPremAktif(io, gid, rec)) || adalahAdmin(io, uid);
+    if ((fitur === "cap" || fitur === "bw") && !prem) {
+      await tampilPanelGrup(io, chatId, uid, gid, CATATAN_PREMIUM_GRUP);
+      return;
+    }
+    if (fitur === "cap") rec.settings.captcha = !rec.settings.captcha;
+    else if (fitur === "bw") rec.settings.badwordsOn = !rec.settings.badwordsOn;
+    else if (fitur === "wel") rec.settings.welcomeOn = !rec.settings.welcomeOn;
+    else return;
+    await simpanGrup(io, gid, rec);
+    await tampilPanelGrup(io, chatId, uid, gid);
+    return;
+  }
+  if (aksi === "link") {
+    const gid = parts[2];
+    const sec = parseInt(parts[3] || "", 10);
+    if (![0, 3600, 86400].includes(sec)) return;
+    const rec = await muatGrup(io, gid);
+    if (!rec || !rec.active) {
+      await io.send(chatId, "That group is no longer active for me.",
+        MENU_MARKUP);
+      return;
+    }
+    if (!(await aksesGrup(io, rec, gid, uid))) {
+      await tolakAksesGrup(io, chatId);
+      return;
+    }
+    rec.settings.antilink = sec;
+    await simpanGrup(io, gid, rec);
+    await tampilPanelGrup(io, chatId, uid, gid);
+    return;
+  }
+  if (aksi === "bwlist" || aksi === "bwadd" || aksi === "bwdel") {
+    const gid = parts[2];
+    const rec = await muatGrup(io, gid);
+    if (!rec || !rec.active) {
+      await io.send(chatId, "That group is no longer active for me.",
+        MENU_MARKUP);
+      return;
+    }
+    if (!(await aksesGrup(io, rec, gid, uid))) {
+      await tolakAksesGrup(io, chatId);
+      return;
+    }
+    const prem = (await grupPremAktif(io, gid, rec)) || adalahAdmin(io, uid);
+    if (!prem) {
+      await tampilPanelGrup(io, chatId, uid, gid, CATATAN_PREMIUM_GRUP);
+      return;
+    }
+    if (aksi === "bwlist") {
+      await tampilDaftarKata(io, chatId, uid, gid);
+      return;
+    }
+    if (aksi === "bwadd") {
+      const c = await muatConv(io, uid);
+      c.mode = "grp_word";
+      c.grpGid = gid;
+      await simpanConv(io, uid, c);
+      await io.send(chatId,
+        `📝 Send me the word or phrase to ban in ${rec.title} — one ` +
+        "message, just the word itself. Any message containing it " +
+        "will be removed.\n\n" +
+        "Changed your mind? Tap 🛡️ My Groups below to cancel.");
+      return;
+    }
+    // bwdel
+    const idx = parseInt(parts[3] || "", 10);
+    if (Number.isInteger(idx) && rec.settings.badwords[idx] !== undefined) {
+      const [terhapus] = rec.settings.badwords.splice(idx, 1);
+      await simpanGrup(io, gid, rec);
+      await tampilDaftarKata(io, chatId, uid, gid,
+        `✅ "${terhapus}" removed from the banned words.`);
+    }
+    return;
+  }
+  if (aksi === "weledit") {
+    const gid = parts[2];
+    const rec = await muatGrup(io, gid);
+    if (!rec || !rec.active) {
+      await io.send(chatId, "That group is no longer active for me.",
+        MENU_MARKUP);
+      return;
+    }
+    if (!(await aksesGrup(io, rec, gid, uid))) {
+      await tolakAksesGrup(io, chatId);
+      return;
+    }
+    const c = await muatConv(io, uid);
+    c.mode = "grp_welcome";
+    c.grpGid = gid;
+    await simpanConv(io, uid, c);
+    await io.send(chatId,
+      `✏️ Send me the new welcome text for ${rec.title}.\n\n` +
+      "You can use {name} for the new member's name and {group} " +
+      "for the group's name. Send the word \"default\" to go back " +
+      "to the standard text.\n\n" +
+      "Current text:\n" +
+      (rec.settings.welcomeText || SAMBUTAN_BAWAAN) + "\n\n" +
+      "Changed your mind? Tap 🛡️ My Groups below to cancel.");
+    return;
+  }
+  if (aksi === "stats") {
+    const gid = parts[2];
+    const rec = await muatGrup(io, gid);
+    if (!rec || !rec.active) {
+      await io.send(chatId, "That group is no longer active for me.",
+        MENU_MARKUP);
+      return;
+    }
+    if (!(await aksesGrup(io, rec, gid, uid))) {
+      await tolakAksesGrup(io, chatId);
+      return;
+    }
+    const prem = (await grupPremAktif(io, gid, rec)) || adalahAdmin(io, uid);
+    if (!prem) {
+      await tampilPanelGrup(io, chatId, uid, gid, CATATAN_PREMIUM_GRUP);
+      return;
+    }
+    await tampilStatGrup(io, chatId, uid, gid);
+    return;
+  }
+  if (aksi === "log") {
+    await tampilLogGrup(io, chatId, uid, parts[2]);
+    return;
+  }
+  if (aksi === "buy") {
+    await beliPremiumGrup(io, chatId, uid, parts[2]);
+    return;
   }
 }
 
@@ -1249,9 +2190,9 @@ async function tampilAdminModules(io, chatId, uid) {
   await io.send(chatId,
     "🛠️ Module switches\n\n" +
     "Tap a module to switch it on or off. While a module is off, users " +
-    "get a friendly note and no quota is used. Group Moderation and " +
-    "Anonymous Chat still answer 'coming soon' while they are on — " +
-    "their phases are not built yet.",
+    "get a friendly note and no quota is used. Anonymous Chat still " +
+    "answers 'coming soon' while it is on — its phase is not built " +
+    "yet. Group Moderation is live in groups where I am an admin.",
     { inline_keyboard: rows });
 }
 
@@ -1300,6 +2241,17 @@ async function handleCallback(io, cq) {
   if (uid == null || chatId == null) return;
   await catatPengguna(io, uid);
   const data = cq.data || "";
+  // The group captcha answers itself (a wrong tapper gets a polite
+  // refusal as the callback answer), so it runs before the generic
+  // empty answer below.
+  if (data.startsWith("grp:cap:")) {
+    const p = data.split(":");
+    // Callback data is text: hand the group id back as a number, the
+    // way message-driven flows receive it from Telegram.
+    const gidCap = /^-?\d+$/.test(p[2] || "") ? Number(p[2]) : p[2];
+    await tanganiCaptcha(io, cq, gidCap, p[3]);
+    return;
+  }
   await io.answerCallback(cq.id);
   if (!adalahAdmin(io, uid) && (await terban(io, uid))) {
     await io.send(chatId, TEKS_BAN, MENU_MARKUP);
@@ -1309,6 +2261,12 @@ async function handleCallback(io, cq) {
 
   if (data === "nav:premium") { await tampilPremium(io, chatId, uid); return; }
   if (data === "buy:premium") { await beliPremium(io, chatId, uid); return; }
+
+  if (data === "grp:noop") return; // label button in the group panel
+  if (data.startsWith("grp:")) {
+    await ruteGrupCallback(io, chatId, uid, data);
+    return;
+  }
 
   if (data === "byok:open") { await tampilByok(io, chatId, uid); return; }
   if (data === "byok:paste") { await mulaiTempelKunci(io, chatId, uid); return; }
@@ -1399,6 +2357,14 @@ export async function handleUpdate(io, update) {
     await handleCallback(io, update.callback_query);
     return;
   }
+  if (update.my_chat_member) {
+    await tanganiMyChatMember(io, update.my_chat_member);
+    return;
+  }
+  if (update.chat_member) {
+    await tanganiChatMember(io, update.chat_member);
+    return;
+  }
   const msg = update.message || {};
   const chatId = msg.chat && msg.chat.id;
   const uid = msg.from && msg.from.id;
@@ -1409,6 +2375,32 @@ export async function handleUpdate(io, update) {
   if (msg.successful_payment) {
     await tanganiPembayaran(io, msg);
     return;
+  }
+
+  // Group chats: joins, leaves and message moderation are handled by
+  // the Group Moderation module. Commands typed in a group keep
+  // falling through to the normal flow below (unchanged behaviour).
+  const tipeChat = (msg.chat && msg.chat.type) || "private";
+  if (tipeChat === "group" || tipeChat === "supergroup") {
+    if (Array.isArray(msg.new_chat_members) && msg.new_chat_members.length) {
+      await tanganiGabungPesan(io, msg);
+      return;
+    }
+    if (msg.left_chat_member) {
+      if (msg.left_chat_member.id != null) {
+        await io.kvDel(
+          `gmember:${chatId}:${msg.left_chat_member.id}`);
+      }
+      return;
+    }
+    const teksGrup = msg.text || msg.caption || "";
+    if (teksGrup && !/^\s*\//.test(teksGrup)) {
+      if (await modulAktif(io, "groups")) {
+        await prosesModerasiGrup(io, msg);
+      }
+      return;
+    }
+    if (!teksGrup) return;
   }
 
   // Banned users are refused by every module (the admin is exempt —
@@ -1462,11 +2454,7 @@ export async function handleUpdate(io, update) {
     return;
   }
   if (text === "🛡️ My Groups") {
-    if (!(await modulAktif(io, "groups"))) {
-      await pesanModulOff(io, chatId, "groups");
-      return;
-    }
-    await io.send(chatId, TEKS_GROUPS_SOON, MENU_MARKUP);
+    await tampilGrupSaya(io, chatId, uid);
     return;
   }
   if (text === "💬 Anonymous Chat") {
@@ -1486,6 +2474,16 @@ export async function handleUpdate(io, update) {
   // and stored only as the key record — never written to chat history.
   if (c.mode === "ai_await_key") {
     await prosesKunciByok(io, chatId, uid, text);
+    return;
+  }
+  // Group panel input states: the message IS the banned word / the
+  // new welcome text for the group being configured.
+  if (c.mode === "grp_word") {
+    await prosesKataMasuk(io, chatId, uid, text);
+    return;
+  }
+  if (c.mode === "grp_welcome") {
+    await prosesSambutanMasuk(io, chatId, uid, text);
     return;
   }
   // A pasted link works from anywhere.
@@ -1590,9 +2588,44 @@ export function buatIo(env) {
       if (!ok && errorMessage) body.error_message = errorMessage;
       await tg("answerPreCheckoutQuery", body);
     },
-    answerCallback: async (id) => {
-      try { await tg("answerCallbackQuery", { callback_query_id: id }); }
+    answerCallback: async (id, text) => {
+      const body = { callback_query_id: id };
+      if (text) body.text = text;
+      try { await tg("answerCallbackQuery", body); }
       catch (e) { /* a stale button tap must not break the flow */ }
+    },
+    // ---- group moderation calls (Phase 2) ----
+    getChatMember: async (chatId, userId) => {
+      const r = await tg("getChatMember",
+        { chat_id: chatId, user_id: userId });
+      const data = await r.json();
+      return (data && data.result) || { status: "member" };
+    },
+    restrictMember: async (chatId, userId, permissions, untilDate) => {
+      await tg("restrictChatMember", { chat_id: chatId, user_id: userId,
+        permissions, until_date: untilDate || 0 });
+    },
+    deleteMsg: async (chatId, messageId) => {
+      await tg("deleteMessage",
+        { chat_id: chatId, message_id: messageId });
+    },
+    banMember: async (chatId, userId) => {
+      await tg("banChatMember", { chat_id: chatId, user_id: userId });
+    },
+    unbanMember: async (chatId, userId) => {
+      await tg("unbanChatMember", { chat_id: chatId, user_id: userId,
+        only_if_banned: true });
+    },
+    // Like send(), but returns the Telegram message_id — the captcha
+    // flow needs it to delete its own check message afterwards.
+    sendMsgId: async (chatId, text, markup) => {
+      const body = { chat_id: chatId, text };
+      if (markup) body.reply_markup = markup;
+      const r = await tg("sendMessage", body);
+      try {
+        const data = await r.json();
+        return (data && data.result && data.result.message_id) || null;
+      } catch (e) { return null; }
     },
     fetchText: async (url) => {
       const r = await fetch(url, {

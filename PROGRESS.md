@@ -564,3 +564,146 @@ bukan sekadar dijaga di kode retry.
 - Penyamaran log hanya mengganti kemunculan PERSIS string URL job;
   stderr yt-dlp yang menyebut ID video tanpa URL penuh tetap tampil
   apa adanya di log (sesuai rancangan: cukup untuk diagnosis).
+
+## Tahap 2 — Modul Moderasi Grup (1 Nov 2026)
+
+Dibangun sesuai konsep §6 + prinsip kemudahan §2 (semua lewat tombol
+di chat pribadi, bahasa sederhana, tanpa perintah hafalan), di atas
+kode Tahap 1 tanpa mengubah perilakunya. Eksekutor TIDAK disentuh.
+
+### Perubahan (worker/worker.js + tests/run_worker_test.mjs)
+
+1. SIKLUS GRUP: handleUpdate merutekan update my_chat_member dan
+   chat_member. Bot ditambah BUKAN admin -> satu pesan sopan meminta
+   diangkat admin (tanpa admin bot tak menerima semua pesan & tak
+   bisa menghapus). Dipromosi -> grup dicatat di KV `group:<gid>`
+   (judul, pengangkat sebagai pengelola awal, setelan bawaan),
+   pengumuman singkat di grup, arahan membuka My Groups di chat
+   pribadi. Bot keluar/dikeluarkan -> record ditandai nonaktif, data
+   TIDAK dihapus. Anggota bergabung ditangani dari pesan layanan
+   new_chat_members DAN chat_member (gabungan ganda dari dua jalur
+   didedupe via record anggota berjangka 1 jam; anggota bot dilewati).
+2. PANEL MY GROUPS (chat pribadi): daftar grup tempat penanya adalah
+   pengelola tercatat ATAU getChatMember menyatakan admin/creator
+   (yang terkonfirmasi dicatat sebagai pengelola — self-healing);
+   pemilik bot melihat semua grup aktif. Panel per grup bersaklar
+   berstatus terlihat: captcha anggota baru, anti-tautan pendatang
+   (tombol pilihan Off/1h/24h), kata terlarang (saklar + daftar:
+   tambah lewat mengetik dalam state grp_word, hapus per kata via
+   tombol), sambutan (saklar + ubah teks dalam state grp_welcome,
+   mendukung {name}/{group}, kata "default" mengembalikan bawaan),
+   statistik minggu ini, log 10 tindakan terakhir, status paket +
+   tombol upgrade. Teks "coming in Phase 2" DIGANTI panel ini; teks
+   sambutan/bantuan/panel saklar modul diselaraskan.
+3. CAPTCHA TOMBOL: anggota baru dibatasi total (restrictChatMember)
+   + pesan berisi tombol "✅ I'm human" yang callback-nya membawa
+   grup+pengguna; ketukan orang lain dijawab penolakan sopan pada
+   jawaban callback itu sendiri. Ketukan benar -> batas dibuka,
+   pesan captcha dihapus (adapter baru `sendMsgId` mengembalikan
+   message_id), sambutan dikirim. Captcha mati -> sambutan langsung.
+4. ANTI-TAUTAN & KATA TERLARANG: tautan (entity url/text_link atau
+   pola teks) dari anggota yang masa bergabungnya < jendela grup ->
+   pelanggaran; kata terlarang dicocokkan case-insensitive pada teks
+   huruf kecil terhadap daftar grup. Admin/creator grup (status
+   Telegram, di-cache 10 menit), bot lain, dan pemilik bot bebas.
+   Anggota tanpa catatan gabung (bergabung sebelum bot masuk)
+   dianggap lama.
+5. TANGGA PERINGATAN per pengguna per grup di KV `gwarn:*`,
+   kedaluwarsa 7 hari: ke-1 hapus + teguran tertulis (menyebut nama
+   + ancaman bisu), ke-2 hapus + bisu 1 jam (until_date), ke-3 hapus
+   + ban lalu unban (bisa bergabung lagi nanti) + cacah dibersihkan.
+   Setiap langkah masuk log grup `glog:*` (maks 50) dan penghitung
+   mingguan `gstat:*` (kunci minggu ISO: joined/deleted/muted/kicked).
+6. FREE vs PREMIUM PER GRUP: grup tanpa langganan aktif = paket Free
+   (anti-tautan + sambutan aktif; captcha, kata terlarang, statistik
+   penuh TERKUNCI berlabel "⭐ Premium per group" — mengetuknya tidak
+   mengubah setelan). Upgrade = invoice Stars pola yang sama persis
+   (250 XTR/30 hari) dengan payload `groupprem:<gid>:<pembeli>`;
+   pre-checkout memvalidasi grup+pembeli+nominal, successful_payment
+   menulis `groupprem:<gid>` (record terpisah dari premium pribadi —
+   pembayaran grup TIDAK mengaktifkan premium pribadi pembeli, dan
+   sebaliknya). Pemilik bot: semua grup Premium, tanpa invoice.
+7. KETAHANAN: semua aksi admin grup lewat pembungkus aksiGrup —
+   kegagalan hak (mis. dicabut diam-diam) tidak pernah meng-crash
+   update; tindakan dilewati dan kehilangan hak dicatat ke log grup
+   maks sekali sehari (`gnoadmin:*`). Bila pembatasan captcha gagal,
+   anggota jatuh ke sambutan biasa (tidak tertahan pending).
+   Adapter buatIo bertambah: getChatMember, restrictMember,
+   deleteMsg, banMember, unbanMember, sendMsgId; answerCallback
+   menerima teks opsional. Update bukan grup tidak terpengaruh.
+
+### Keputusan desain di titik yang konsepnya diam
+
+- Grup ke-2+ seorang pengelola diperlakukan SAMA dengan grup
+  pertama (mode dasar Free yang sama + catatan Premium yang sama):
+  kalimat tugas "hanya mode dasar + catatan yang sama" dibaca sebagai
+  set fitur dasar yang sama, bukan mematikan penjagaan dasar —
+  mematikan anti-tautan/sambutan untuk grup ke-2 tidak tertulis di
+  konsep §6 maupun tugas. Yang membedakan hanya label paket di panel.
+- Log tindakan tetap bisa dibuka di paket Free (ia mencatat tindakan
+  fitur Free — anti-tautan); yang terkunci di Free persis yang disebut
+  tugas: captcha, kata terlarang, statistik penuh.
+- Setelan bawaan grup baru: anti-tautan 24 jam AKTIF + sambutan AKTIF
+  (dua fitur Free "aktif" per konsep), captcha MATI, kata terlarang
+  MATI dengan daftar kosong.
+- Pencocokan kata terlarang = substring pada teks huruf kecil
+  (sederhana, dapat diprediksi admin); bukan pencocokan kata utuh.
+- Status admin grup untuk pembebasan moderasi di-cache 10 menit di
+  KV agar grup ramai tidak memanggil getChatMember per pesan.
+
+### Penyesuaian uji lama (eksplisit)
+
+- Bagian 9: assertion "My Groups -> Phase 2 + ringkasan manfaat"
+  DIGANTI — perilaku "coming in Phase 2" memang dihapus oleh tugas
+  ini. Assertion baru membuktikan panel sungguhan (daftar kosong +
+  langkah menambah bot + TIDAK ada teks "coming in Phase 2"). Judul
+  bagian disesuaikan. Assertion Anonymous Chat di bagian yang sama
+  tidak berubah.
+- Harness buatIo diperluas (bukan diubah perilakunya): answerCallback
+  kini MENCATAT {id, text}; ditambah tiruan getChatMember
+  (opts.memberStatus), restrictMember, deleteMsg, banMember,
+  unbanMember, sendMsgId + pencatat restricts/deletions/bans/unbans/
+  memberChecks/cbJawaban + opts.failActions. Tidak ada assertion lama
+  yang bergantung pada bentuk lama.
+
+### Hasil uji putaran ini (dijalankan di mesin ini)
+
+- Baseline: Worker 199/199, eksekutor 38/38.
+- `node tests/run_worker_test.mjs` -> **271 lulus, 0 gagal** =
+  199 lama (dengan 1 penyesuaian bagian 9 di atas) + 72 baru di
+  bagian 23: bot ditambah non-admin -> pesan promosi; dipromosi ->
+  tercatat + pengumuman; panel tampil untuk pengelola, untuk admin
+  grup via getChatMember (self-healing tercatat), ditolak untuk
+  bukan pengelola; pemilik melihat semua; captcha menyala ->
+  dibatasi + pesan tombol; ketukan orang lain ditolak di jawaban
+  callback; ketukan benar -> dibuka + pesan captcha terhapus +
+  sambutan; gabungan chat_member + dedupe dua jalur; tangga tautan
+  1/2/3 (tegur -> bisu ±1 jam -> ban+unban) + statistik & log
+  bertambah; admin grup dan anggota lama kebal; kata terlarang
+  case-insensitive di grup Premium + kelola daftar (tambah via
+  mengetik, hapus per tombol); kata terlarang TIDAK ditegakkan di
+  Free; saklar Free terkunci berlabel Premium (captcha/kata
+  terlarang/statistik); invoice upgrade grup terbit (payload
+  groupprem) + pre-checkout menolak nominal/pembeli salah +
+  pembayaran mengaktifkan groupprem TANPA menyentuh premium
+  pribadi; pemilik tanpa invoice; hak admin hilang -> tidak crash +
+  log noadmin sekali sehari + anggota tidak tertahan; bot
+  dikeluarkan -> nonaktif + moderasi berhenti; modul groups off ->
+  panel menolak jujur dan kejadian grup diam.
+- `python3 tests/run_executor_test.py` -> **38 lulus, 0 gagal**
+  (tidak disentuh). `node --check worker/worker.js` OK. Grep nama
+  pribadi di worker/ + tests/ -> 0 temuan.
+
+### Belum terbukti untuk tambahan ini
+
+- Perilaku di layanan asli — belum di-push/di-deploy (menunggu picu
+  agen induk). Bukti akhir: pemilik menambahkan bot sebagai admin ke
+  grup sungguhan dari HP.
+- Update chat_member hanya dikirim Telegram bila webhook dipasang
+  dengan allowed_updates yang memuat "chat_member" (dan
+  "my_chat_member"); jalur pesan layanan new_chat_members bekerja
+  tanpa itu, jadi gabungan tetap tertangani — pemasangan webhook di
+  sisi deploy perlu memastikan kedua jenis update itu diizinkan.
+- getChatMember/restrict/delete/ban pada adapter asli belum teramati
+  live; di uji lokal adapter grup diwakili tiruan tercatat, dan
+  perilaku Worker dibuktikan terhadap tiruan itu.
