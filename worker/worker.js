@@ -165,18 +165,27 @@ export function hariIniUTC(d = new Date()) {
   return d.toISOString().slice(0, 10);
 }
 
-const DL_HOSTS = ["tiktok.com", "instagram.com", "youtube.com", "youtu.be",
-  "x.com", "twitter.com"];
-
 export function cariTautan(text) {
   const m = (text || "").match(/https?:\/\/[^\s]+/i);
   return m ? m[0].replace(/[)\].,]+$/, "") : null;
 }
 
-export function tautanDidukung(url) {
-  let host;
-  try { host = new URL(url).hostname.toLowerCase(); } catch (e) { return false; }
-  return DL_HOSTS.some(h => host === h || host.endsWith("." + h));
+// The downloader is NOT locked to a platform list (owner decision,
+// 1 Nov): the executor's yt-dlp supports 1,000+ sites, so the gate
+// here is only that the link is a plausible web URL — http/https
+// scheme and a parseable host. Whether a given post can actually be
+// fetched is decided by the site itself, and failures are reported
+// plainly by the executor's result messages.
+export function tautanSah(url) {
+  let u;
+  try { u = new URL(url); } catch (e) { return false; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  const host = u.hostname.toLowerCase();
+  if (!host) return false;
+  // Dotted hosts (incl. subdomains) and IP literals pass; a single
+  // bare label passes too when it is a plausible hostname token.
+  return host.includes(".") || host.includes(":") ||
+    /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(host);
 }
 
 function teksStrip(html) {
@@ -196,7 +205,7 @@ function teksWelcome(nama) {
   const awal = nama ? `👋 Hi, ${nama}!` : "👋 Hi!";
   return `${awal} I'm Wesio — one bot with several tools inside.\n\n` +
     "🤖 AI Chat — ask questions, write, translate, summarize\n" +
-    "⬇️ Downloader — save videos from TikTok, Instagram, YouTube & X\n" +
+    "⬇️ Downloader — save videos & audio from almost any site\n" +
     "🛡️ Group Moderation — coming in Phase 2\n" +
     "💬 Anonymous Chat — coming in Phase 3\n" +
     "⭐ Premium — bigger quotas and the strongest AI model\n\n" +
@@ -208,9 +217,11 @@ const TEKS_HELP =
   "🤖 AI Chat — tap it, then just type your question. Use the small buttons " +
   "inside for quick tasks: Summarize, Rewrite, Translate, Explain, and " +
   "(Premium) Image.\n\n" +
-  "⬇️ Downloader — tap it, paste a TikTok / Instagram / YouTube / X link, " +
-  "choose Video or Audio, and the file arrives here. You can also paste a " +
-  "link straight into this chat.\n\n" +
+  "⬇️ Downloader — tap it, paste a video or audio link from almost " +
+  "any site (YouTube, TikTok, Instagram, Facebook, X, Dailymotion, " +
+  "Vimeo, Reddit, and 1,000+ more), choose Video or Audio, and the " +
+  "file arrives here. You can also paste a link straight into this " +
+  "chat.\n\n" +
   "⭐ Premium — one subscription raises every quota and unlocks the strong " +
   "AI model. Tap ⭐ Premium to compare Free vs Premium.\n\n" +
   "Quotas reset every day at 00:00 UTC. Commands if you like typing: " +
@@ -991,8 +1002,11 @@ async function mulaiDownload(io, chatId, uid) {
   const sisa = await sisaDl(io, uid, prem);
   await io.send(chatId,
     "⬇️ Downloader\n\n" +
-    "Send me a video link from TikTok, Instagram, YouTube or X, and " +
-    "I'll send the file back here.\n" +
+    "Send me a video or audio link from almost any site — YouTube, " +
+    "TikTok, Instagram, Facebook, X, Dailymotion, Vimeo, Reddit, and " +
+    "1,000+ other sites — and I'll send the file back here. If a post " +
+    "is private or a site refuses the download, I'll tell you " +
+    "plainly.\n" +
     "Example: https://www.tiktok.com/@user/video/123456789\n\n" +
     (adalahAdmin(io, uid)
       ? "👑 Owner: unlimited downloads"
@@ -1006,11 +1020,18 @@ async function terimaTautan(io, chatId, uid, teks) {
     return;
   }
   const url = cariTautan(teks);
-  if (!url || !tautanDidukung(url)) {
+  if (!url) {
     await io.send(chatId,
-      "That link is not from a supported site. I can download from " +
-      "TikTok, Instagram, YouTube and X — please send a link from one " +
-      "of those.", MENU_MARKUP);
+      "I couldn't find a link in that message. Please send me a video " +
+      "or audio link — it should start with http:// or https://. " +
+      "Links from almost any site are welcome.", MENU_MARKUP);
+    return;
+  }
+  if (!tautanSah(url)) {
+    await io.send(chatId,
+      "That link doesn't look complete or valid. Please check it and " +
+      "send the full link again — it should start with http:// or " +
+      "https://.", MENU_MARKUP);
     return;
   }
   const prem = await premiumAktif(io, uid);
@@ -1467,8 +1488,8 @@ export async function handleUpdate(io, update) {
     await prosesKunciByok(io, chatId, uid, text);
     return;
   }
-  // A pasted supported link works from anywhere.
-  if (cariTautan(text) && tautanDidukung(cariTautan(text))) {
+  // A pasted link works from anywhere.
+  if (cariTautan(text) && tautanSah(cariTautan(text))) {
     if (c.mode === "ai" && c.aiTask === "summarize") {
       await prosesAi(io, chatId, uid, text);
       return;
@@ -1486,8 +1507,8 @@ export async function handleUpdate(io, update) {
   }
   await io.send(chatId,
     "Tap a button below to pick a tool — 🤖 AI Chat for questions, " +
-    "⬇️ Downloader to save a video. Or paste a TikTok / Instagram / " +
-    "YouTube / X link right here.", MENU_MARKUP);
+    "⬇️ Downloader to save a video. Or paste a video link from " +
+    "almost any site right here.", MENU_MARKUP);
 }
 
 // ---------------- Cloudflare adapter ----------------

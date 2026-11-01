@@ -401,3 +401,81 @@ tidak berubah dan tetap lulus pada pesan dua-jalur yang baru.
 - Peralihan nyata terhadap kuota provider asli (429 sungguhan dari
   Gemini/OpenRouter lalu jawaban dari kunci sistem sungguhan)
   belum teramati di layanan asli.
+
+# Tambahan 1 Nov 2026 — Downloader dibuka ke semua tautan (kunci platform dicabut)
+
+Keputusan pemilik: downloader mendukung SEMUA tautan video, tidak
+terkunci ke beberapa platform. Sebelumnya Worker hanya menerima
+host dalam whitelist `DL_HOSTS` (tiktok.com, instagram.com,
+youtube.com, youtu.be, x.com, twitter.com) dan menolak sisanya di
+muka — padahal mesin yt-dlp di eksekutor mendukung 1.000+ situs.
+
+## Perubahan (worker/worker.js)
+
+1. `DL_HOSTS` dihapus; `tautanDidukung()` diganti `tautanSah()`:
+   validasi umum URL — lolos bila (a) skema http:// atau https://,
+   (b) terurai sebagai URL sah, (c) host terisi dan masuk akal
+   (mengandung titik termasuk subdomain, literal IP, atau label
+   tunggal yang sah). Skema lain (file:, ftp:, data:, javascript:)
+   tidak pernah lolos — `cariTautan()` memang hanya mengekstrak
+   http(s), dan `tautanSah()` memeriksa protokol secara eksplisit.
+   Router global ("paste a link anywhere") memakai fungsi yang sama.
+2. Pesan penolakan `terimaTautan()` dipecah dua:
+   - tidak ada tautan sama sekali (teks biasa, file:, dll.) →
+     panduan "I couldn't find a link in that message. Please send
+     me a video or audio link — it should start with http:// or
+     https://. Links from almost any site are welcome."
+   - tautan http(s) tapi tidak terurai sah → panduan periksa-ulang
+     tautan lengkap. Pesan lama "not from a supported site" hilang.
+3. Teks pengguna diselaraskan di semua tempat yang menyebut daftar
+   platform: Welcome ("save videos & audio from almost any site"),
+   Help (daftar contoh diperluas: Facebook, Dailymotion, Vimeo,
+   Reddit, "1,000+ more"), intro Downloader (kalimat kanonis:
+   "Send me a video or audio link from almost any site — YouTube,
+   TikTok, Instagram, Facebook, X, Dailymotion, Vimeo, Reddit, and
+   1,000+ other sites — … If a post is private or a site refuses
+   the download, I'll tell you plainly."), dan petunjuk cadangan
+   di akhir router ("paste a video link from almost any site").
+4. Eksekutor DIPERIKSA: TIDAK ada validasi host di executor/*.py —
+   `executor_job.py` meneruskan `job["url"]` apa adanya ke
+   `unduh()` → yt-dlp, jadi tidak ada yang perlu diubah di sana.
+   Pemetaan alasan gagal ("unavailable" dkk.) tidak disentuh.
+5. Kuota, tombol Video/Audio, job, dan dispatch tidak berubah.
+
+## Penyesuaian uji lama (eksplisit)
+
+- Bagian 5: judul "validasi domain" → "validasi tautan". Skenario
+  lama "https://example.com/video/1 → ditolak 'not from a
+  supported site' + tanpa job" TIDAK berlaku lagi karena perilaku
+  itu memang dicabut; diganti 4 assertion baru: teks bukan tautan →
+  panduan + tanpa job; skema file:/// → panduan yang sama + tanpa
+  job. Sisa bagian 5 (alur TikTok, dispatch, job KV, kuota 4 of 5)
+  tidak berubah dan tetap lulus. Penerimaan example.com kini
+  diuji positif di bagian 22. Tidak ada assertion lama lain yang
+  disentuh.
+
+## Hasil uji putaran ini (dijalankan di mesin ini)
+
+- Baseline sebelum perubahan: Worker **185/185**, eksekutor
+  **12/12**.
+- `node tests/run_worker_test.mjs` → **199 lulus, 0 gagal** = 185
+  uji lama (dengan penyesuaian bagian 5 di atas: −2 assertion lama,
+  +4 assertion pengganti) + 12 uji baru bagian 22: intro memuat
+  teks terbuka; Facebook diterima + dispatch + job url facebook;
+  Vimeo ditempel langsung di chat diterima + job audio; Dailymotion
+  diterima + dispatch; domain acak https://example-site.com/watch/1
+  diterima + job url utuh; example.com diterima; tautan X (platform
+  lama) tetap diterima.
+- `python3 tests/run_executor_test.py` → **12 lulus, 0 gagal**
+  (tidak disentuh). `node --check worker/worker.js` → OK.
+
+## Belum terbukti untuk tambahan ini
+
+- Perilaku di layanan asli — putaran ini belum di-push dan belum
+  di-deploy ke Worker live (menunggu picu agen induk); bukti di
+  atas adalah uji lokal dengan io tiruan.
+- Unduhan nyata dari platform di luar daftar lama (Facebook,
+  Vimeo, Dailymotion, dsb.) belum teramati di layanan asli;
+  penerimaan tautan di Worker terbukti lokal, keberhasilan unduh
+  per situs tetap bergantung penolakan/pembatasan situs itu
+  sendiri dan dilaporkan apa adanya oleh eksekutor.

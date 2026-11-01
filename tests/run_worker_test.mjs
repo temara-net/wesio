@@ -164,16 +164,21 @@ console.log("4) Model kuat khusus Premium; tugas cepat Summarize jalan");
       W.aiCalls[1].messages[0].content.includes("Summarize"), JSON.stringify(W.aiCalls[1]?.messages?.[0]));
 }
 
-console.log("5) Alur Downloader: validasi domain, tombol format, job + dispatch, kuota");
+console.log("5) Alur Downloader: validasi tautan, tombol format, job + dispatch, kuota");
 {
   const W = buatIo({ ai: AI_ON });
   await handleUpdate(W.io, msg(5001, "⬇️ Downloader"));
   cek("intro Downloader menampilkan sisa 5 of 5",
       terakhir(W).text.includes("left today: 5 of 5"), terakhir(W).text.slice(-150));
-  await handleUpdate(W.io, msg(5001, "https://example.com/video/1"));
-  cek("tautan di luar platform didukung -> ditolak jelas",
-      terakhir(W).text.includes("not from a supported site"), terakhir(W).text.slice(0, 150));
-  cek("tidak ada job dari tautan tidak sah", W.dispatches.length === 0, "");
+  await handleUpdate(W.io, msg(5001, "tolong unduhkan video yang ini ya"));
+  cek("teks bukan tautan -> panduan kirim tautan",
+      terakhir(W).text.includes("couldn't find a link") &&
+      terakhir(W).text.includes("https://"), terakhir(W).text.slice(0, 150));
+  cek("tidak ada job dari teks biasa", W.dispatches.length === 0, "");
+  await handleUpdate(W.io, msg(5001, "file:///etc/passwd"));
+  cek("skema file: -> ditolak dengan panduan yang sama",
+      terakhir(W).text.includes("couldn't find a link"), terakhir(W).text.slice(0, 150));
+  cek("tidak ada job dari skema file:", W.dispatches.length === 0, "");
   await handleUpdate(W.io, msg(5001, "https://www.tiktok.com/@user/video/123456"));
   const fmtBtn = (terakhir(W).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
   cek("tautan sah -> tombol Video|Audio tampil",
@@ -1261,6 +1266,87 @@ console.log("21) Rantai TOTAL: BYOK kering -> otomatis lanjut ke kunci sistem; u
       hitungCatatan(Wg) === 0 &&
       !terakhir(Wg).text.includes("AI messages left today"),
       terakhir(Wg).text.slice(-300));
+}
+
+console.log("22) Downloader terbuka: semua tautan http(s) sah diterima, bukan cuma platform lama");
+{
+  const W0 = buatIo({ ai: AI_ON });
+  await handleUpdate(W0.io, msg(22000, "⬇️ Downloader"));
+  cek("intro Downloader: teks terbuka 'almost any site' + contoh + kejujuran penolakan",
+      terakhir(W0).text.includes("almost any site") &&
+      terakhir(W0).text.includes("Facebook") &&
+      terakhir(W0).text.includes("1,000+ other sites") &&
+      terakhir(W0).text.includes("refuses the download"),
+      terakhir(W0).text.slice(0, 300));
+
+  // Facebook lewat mode unduh, format video.
+  const W1 = buatIo({ ai: AI_ON });
+  await handleUpdate(W1.io, msg(22001, "⬇️ Downloader"));
+  await handleUpdate(W1.io, msg(22001, "https://www.facebook.com/watch/?v=123456789"));
+  const fmt1 = (terakhir(W1).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+  cek("tautan Facebook -> tombol Video|Audio tampil",
+      fmt1.includes("dl:video") && fmt1.includes("dl:audio"), JSON.stringify(fmt1));
+  await handleUpdate(W1.io, cb(22001, "dl:video"));
+  cek("Facebook: dispatch tepat 1x", W1.dispatches.length === 1, JSON.stringify(W1.dispatches));
+  const jobKey1 = [...W1.kv.keys()].find(k => k.startsWith("job:"));
+  const job1 = jobKey1 ? JSON.parse(W1.kv.get(jobKey1)) : null;
+  cek("Facebook: job tertulis (url facebook + format video)",
+      !!job1 && job1.url.includes("facebook.com") && job1.format === "video",
+      jobKey1 || "job tidak ada");
+
+  // Vimeo ditempel langsung di chat, tanpa masuk mode unduh dulu.
+  const W2 = buatIo({ ai: AI_ON });
+  await handleUpdate(W2.io, msg(22002, "https://vimeo.com/123456789"));
+  const fmt2 = (terakhir(W2).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+  cek("tautan Vimeo ditempel langsung -> tombol format tampil",
+      fmt2.includes("dl:video") && fmt2.includes("dl:audio"), JSON.stringify(fmt2));
+  await handleUpdate(W2.io, cb(22002, "dl:audio"));
+  const jobKey2 = [...W2.kv.keys()].find(k => k.startsWith("job:"));
+  const job2 = jobKey2 ? JSON.parse(W2.kv.get(jobKey2)) : null;
+  cek("Vimeo: dispatch 1x + job audio url vimeo",
+      W2.dispatches.length === 1 && !!job2 && job2.format === "audio" &&
+      job2.url.includes("vimeo.com"), JSON.stringify(W2.dispatches));
+
+  // Dailymotion lewat mode unduh.
+  const W3 = buatIo({ ai: AI_ON });
+  await handleUpdate(W3.io, msg(22003, "⬇️ Downloader"));
+  await handleUpdate(W3.io, msg(22003, "https://www.dailymotion.com/video/x8abcd1"));
+  const fmt3 = (terakhir(W3).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+  cek("tautan Dailymotion -> tombol format tampil",
+      fmt3.includes("dl:video") && fmt3.includes("dl:audio"), JSON.stringify(fmt3));
+  await handleUpdate(W3.io, cb(22003, "dl:video"));
+  cek("Dailymotion: dispatch tepat 1x", W3.dispatches.length === 1, JSON.stringify(W3.dispatches));
+
+  // Domain acak bervideo yang dulu pasti ditolak whitelist.
+  const W4 = buatIo({ ai: AI_ON });
+  await handleUpdate(W4.io, msg(22004, "⬇️ Downloader"));
+  await handleUpdate(W4.io, msg(22004, "https://example-site.com/watch/1"));
+  const fmt4 = (terakhir(W4).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+  cek("domain acak bervideo -> diterima, tombol format tampil",
+      fmt4.includes("dl:video") && fmt4.includes("dl:audio"), JSON.stringify(fmt4));
+  await handleUpdate(W4.io, cb(22004, "dl:video"));
+  const jobKey4 = [...W4.kv.keys()].find(k => k.startsWith("job:"));
+  const job4 = jobKey4 ? JSON.parse(W4.kv.get(jobKey4)) : null;
+  cek("domain acak: dispatch 1x + job url utuh",
+      W4.dispatches.length === 1 && !!job4 &&
+      job4.url === "https://example-site.com/watch/1",
+      jobKey4 || "job tidak ada");
+
+  // example.com — dulu contoh penolakan whitelist, kini diterima.
+  const W5 = buatIo({ ai: AI_ON });
+  await handleUpdate(W5.io, msg(22005, "⬇️ Downloader"));
+  await handleUpdate(W5.io, msg(22005, "https://example.com/video/1"));
+  const fmt5 = (terakhir(W5).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+  cek("example.com (dulu ditolak whitelist) -> kini diterima",
+      fmt5.includes("dl:video") && fmt5.includes("dl:audio"), JSON.stringify(fmt5));
+
+  // Platform lama tetap jalan.
+  const W6 = buatIo({ ai: AI_ON });
+  await handleUpdate(W6.io, msg(22006, "⬇️ Downloader"));
+  await handleUpdate(W6.io, msg(22006, "https://x.com/someuser/status/123456"));
+  const fmt6 = (terakhir(W6).markup?.inline_keyboard || []).flat().map(b => b.callback_data);
+  cek("tautan X (platform lama) tetap diterima",
+      fmt6.includes("dl:video") && fmt6.includes("dl:audio"), JSON.stringify(fmt6));
 }
 
 console.log(`\nHASIL: ${lulus} lulus, ${gagal} gagal`);
